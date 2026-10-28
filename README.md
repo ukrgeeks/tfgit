@@ -6,6 +6,11 @@ This action validates a tfgit secret, downloads the head of the pull request sel
 name: tfgit
 on:
   workflow_dispatch:
+    inputs:
+      pull_request_number:
+        description: Pull request to run against
+        required: true
+        type: number
 permissions:
   contents: read
   pull-requests: write
@@ -30,6 +35,8 @@ jobs:
 
 The only action input needed is `tfgit_secret`. tfgit supplies the playbook and PR number. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
 
+Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the pull request event, `workflow_dispatch` input, or `repository_dispatch` `client_payload.pull_request_number`.
+
 By default, the action posts the tfgit secret and GitHub run context to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate`. On success, the service must return JSON in this shape. `playbook` is an ordered list of shell commands; tfgit runs each command in the downloaded PR workspace, stopping after the first failed command.
 
 ```json
@@ -44,3 +51,7 @@ By default, the action posts the tfgit secret and GitHub run context to `https:/
 ```
 
 The action downloads the PR head through the base repository's `pull/<number>/head` ref using `contents: read`, runs the playbook commands in order, and posts each command's output as a PR comment using `pull-requests: write`. If a command fails, later commands are skipped, the output is still commented, and the action fails. Override `service_url` or `validation_path` if the service uses a different endpoint.
+
+After running, the action also reports the run status, URL, and up to 60 KB of command output to `/api/v1/github-actions/report`. This data is displayed only in the owning user's Terraform dashboard.
+
+The playbook is executable shell input and the action checks out/runs the PR head. Do not expose AWS/cloud credentials to this job for untrusted PRs. Review command output before sharing it in PR comments; Terraform output may contain sensitive values.

@@ -15,6 +15,7 @@ async function main() {
   const workspace = process.env.GITHUB_WORKSPACE;
   const repoFullName = process.env.GITHUB_REPOSITORY;
   const workflowToken = process.env.GITHUB_TOKEN;
+  const pullRequestNumber = readPullRequestNumber();
 
   if (!secret) fail('Input tfgit_secret is required.');
   if (!workspace || !repoFullName) {
@@ -32,6 +33,7 @@ async function main() {
         repository: repoFullName,
         run_id: process.env.GITHUB_RUN_ID,
         run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+        pull_request_number: pullRequestNumber,
       }),
     });
   } catch (error) {
@@ -98,8 +100,28 @@ async function main() {
   }
 
   const steps = runPlaybook(playbook, workspace);
-  const playbookOutput = formatPlaybookOutput(steps);
+  const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+  const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
+  try {
+    const reportResponse = await fetch(new URL('/api/v1/github-actions/report', serviceUrl), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify({
+        secret,
+        repository: repoFullName,
+        pull_request_number: Number(prNumber),
+        run_id: process.env.GITHUB_RUN_ID || '',
+        run_attempt: process.env.GITHUB_RUN_ATTEMPT || '1',
+        status: runStatus,
+        output: playbookOutput.slice(0, 60000),
+        run_url: runUrl,
+      }),
+    });
+    if (!reportResponse.ok) console.error(`::warning::Could not save the Terraform run output in the tfgit dashboard (HTTP ${reportResponse.status}).`);
+  } catch (error) {
+    console.error(`::warning::Could not reach the tfgit dashboard to save run output: ${error.message}`);
+  }
   const commentBody = [
     '### tfgit playbook output',
     `Run: ${runUrl}`,
@@ -130,6 +152,26 @@ async function main() {
   if (steps.some((step) => step.status !== 'success')) {
     fail('One or more tfgit playbook commands failed. See the pull request comment for output.');
   }
+}
+
+function readPullRequestNumber() {
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) fail('GITHUB_EVENT_PATH is unavailable; run tfgit from a pull request workflow event.');
+  let event;
+  try {
+    event = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
+  } catch {
+    fail('Could not read the GitHub event payload.');
+  }
+  const value = event.pull_request?.number
+    ?? event.issue?.number
+    ?? event.client_payload?.pull_request_number
+    ?? event.inputs?.pull_request_number
+    ?? event.pull_request_number;
+  if (!Number.isSafeInteger(Number(value)) || Number(value) < 1) {
+    fail('The GitHub event must include a pull request number (pull_request_number for workflow_dispatch/repository_dispatch).');
+  }
+  return Number(value);
 }
 
 function runPlaybook(commands, workspace) {
