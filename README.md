@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
-  pull-requests: read
+  pull-requests: write
 jobs:
   run:
     runs-on: ubuntu-latest
