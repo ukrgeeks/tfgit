@@ -1,0 +1,27 @@
+name: tfgit
+description: Validate a tfgit secret and download the current pull request head
+author: UkrGeeks
+inputs:
+  tfgit_secret:
+    description: Secret used to authenticate with tfgit
+    required: true
+  playbook:
+    description: tfgit playbook name
+    required: true
+  github_token:
+    description: Optional token for downloading private PR head repositories and higher API limits
+    required: false
+  pr_number:
+    description: Pull request number; can also be supplied by dispatch event inputs or client_payload
+    required: false
+  service_url:
+    description: Base URL of the tfgit service
+    required: false
+    default: https://tfgit.ukrgeeks.com
+  validation_path:
+    description: Path on the tfgit service used to validate credentials
+    required: false
+    default: /api/v1/github-actions/validate
+runs:
+  using: node20
+  main: src/main.js
