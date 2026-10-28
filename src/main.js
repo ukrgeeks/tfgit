@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { execFileSync } = require('node:child_process');
+const { execFileSync, spawnSync } = require('node:child_process');
 
 function fail(message) {
   console.error(`::error::${message}`);
@@ -51,14 +51,14 @@ async function main() {
 
   const playbook = validation.playbook;
   const prNumber = validation.pr_number || validation.pull_request_number;
-  if (!playbook || !prNumber) {
-    fail('tfgit response must include playbook and pr_number.');
+  if (!Array.isArray(playbook) || playbook.length === 0 || !playbook.every((command) => typeof command === 'string' && command.trim())) {
+    fail('tfgit response playbook must be a non-empty array of command strings.');
+  }
+  if (!prNumber) {
+    fail('tfgit response must include pr_number.');
   }
   if (!workflowToken) {
     fail('Set GITHUB_TOKEN in the Run tfgit step environment and grant contents: read and pull-requests: write to the workflow token.');
-  }
-  if (validation.playbook_output === undefined) {
-    fail('tfgit response must include playbook_output with the completed playbook step output.');
   }
   if (!/^\d+$/.test(String(prNumber))) {
     fail('tfgit response pr_number must be a positive integer.');
@@ -97,15 +97,16 @@ async function main() {
     try { fs.unlinkSync(archivePath); } catch {}
   }
 
-  const playbookOutput = formatPlaybookOutput(validation.playbook_output);
+  const steps = runPlaybook(playbook, workspace);
+  const playbookOutput = formatPlaybookOutput(steps);
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const commentBody = [
-    `### tfgit playbook: ${playbook}`,
+    '### tfgit playbook output',
     `Run: ${runUrl}`,
     '',
-    '```text',
+    '````text',
     playbookOutput.slice(0, 60000),
-    '```',
+    '````',
     ...(playbookOutput.length > 60000 ? ['', '_Output truncated to fit in a GitHub comment._'] : []),
   ].join('\n');
   const commentResponse = await fetch(
@@ -126,20 +127,39 @@ async function main() {
     fail(`Could not comment on pull request ${prNumber} (HTTP ${commentResponse.status}). Check that the workflow token has pull-requests: write permission.`);
   }
   console.log(`Posted playbook output to pull request ${prNumber}.`);
+  if (steps.some((step) => step.status !== 'success')) {
+    fail('One or more tfgit playbook commands failed. See the pull request comment for output.');
+  }
 }
 
-function formatPlaybookOutput(output) {
-  if (typeof output === 'string') return output;
-  if (Array.isArray(output)) {
-    return output.map((step, index) => {
-      if (typeof step === 'string') return `Step ${index + 1}\n${step}`;
-      const name = step.name || step.step || `Step ${index + 1}`;
-      const status = step.conclusion || step.status;
-      const detail = step.output ?? step.logs ?? step.message ?? '';
-      return `${name}${status ? ` (${status})` : ''}\n${detail}`;
-    }).join('\n\n');
+function runPlaybook(commands, workspace) {
+  const results = [];
+  for (const [index, command] of commands.entries()) {
+    console.log(`Running tfgit playbook step ${index + 1}/${commands.length}: ${command}`);
+    const result = spawnSync(command, {
+      cwd: workspace,
+      env: process.env,
+      shell: true,
+      encoding: 'utf8',
+      maxBuffer: 20 * 1024 * 1024,
+      timeout: 30 * 60 * 1000,
+    });
+    const output = [result.stdout, result.stderr, result.error?.message]
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+    const status = !result.error && result.status === 0 ? 'success' : 'failure';
+    results.push({ command, status, output: output || '(no output)' });
+    if (status === 'failure') break;
   }
-  return JSON.stringify(output, null, 2);
+  return results;
+}
+
+function formatPlaybookOutput(steps) {
+  return steps.map((step, index) => [
+    `Step ${index + 1}: ${step.command} — ${step.status}`,
+    step.output,
+  ].join('\n')).join('\n\n');
 }
 
 main().catch((error) => fail(error.message));

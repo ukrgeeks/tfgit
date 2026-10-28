@@ -1,6 +1,6 @@
 # tfgit GitHub Action
 
-This action validates a tfgit secret and replaces the checked out workspace contents with the head commit of a pull request. It is designed for workflows started by tfgit through `workflow_dispatch` or `repository_dispatch`.
+This action validates a tfgit secret, downloads the head of the pull request selected by tfgit, and posts the playbook output as a PR comment. It is designed for workflows started by tfgit through `workflow_dispatch` or `repository_dispatch`.
 
 ```yaml
 name: tfgit
@@ -22,13 +22,25 @@ jobs:
 
       - name: Run tfgit
         uses: ukrgeeks/tfgit@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           tfgit_secret: ${{ secrets.TFGIT_SECRET }}
-          playbook: dev-eks
-          pr_number: ${{ inputs.pr_number }}
-          github_token: ${{ github.token }}
 ```
 
-The action posts `{ "secret": "…", "playbook": "…" }` to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate` by default. For an accepted secret and playbook, the service should return JSON with `{"valid": true, "pr_number": 123}`. The action uses that PR number to look up and download the PR head. `pull_request_number` is accepted as an alias. An optional `message` is shown when validation fails. Override `service_url` and `validation_path` if the service uses a different route.
+The only action input needed is `tfgit_secret`. tfgit supplies the playbook and PR number. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
 
-If the validation response omits the PR number, it can also be passed as the action's `pr_number` input, as a `workflow_dispatch` input named `pr_number` or `pull_request_number`, or in `repository_dispatch`'s `client_payload` under either name. The action looks up that PR in `GITHUB_REPOSITORY`, then downloads its head archive using `github_token` and extracts it into `GITHUB_WORKSPACE`. Pass a token with `contents: read` and `pull-requests: read`; accessing private fork repositories may require additional access.
+By default, the action posts the tfgit secret and GitHub run context to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate`. On success, the service must return JSON in this shape. `playbook` is an ordered list of shell commands; tfgit runs each command in the downloaded PR workspace, stopping after the first failed command.
+
+```json
+{
+  "valid": true,
+  "playbook": [
+    "terraform init",
+    "terraform plan -var-file=env/dev.tfvars"
+  ],
+  "pr_number": 123
+}
+```
+
+The action downloads the PR head through the base repository's `pull/<number>/head` ref using `contents: read`, runs the playbook commands in order, and posts each command's output as a PR comment using `pull-requests: write`. If a command fails, later commands are skipped, the output is still commented, and the action fails. Override `service_url` or `validation_path` if the service uses a different endpoint.
