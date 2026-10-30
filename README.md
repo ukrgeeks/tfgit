@@ -2,7 +2,7 @@
 
 This action validates a tfgit secret, downloads the head of the pull request selected by tfgit, and posts the playbook output as a PR comment. It is designed for workflows started by tfgit through `workflow_dispatch` or `repository_dispatch`.
 
-The TFgit service can dispatch this workflow for pull request lifecycle events and when a repository owner, member, or collaborator adds a comment to an open PR. The service ignores its own output comment so it does not trigger another run.
+The TFgit service dispatches this workflow for pull request lifecycle events and for comments on an open PR by a repository owner, member, or collaborator. Terraform command comments run after the saved setup steps. Comments that do not start with `terraform` get an `Unknown command` reply; the action's own output comment does not trigger another run.
 
 ```yaml
 name: tfgit
@@ -13,6 +13,11 @@ on:
         description: Pull request to run against
         required: true
         type: number
+      command:
+        description: Optional PR comment command (terraform plan, apply, or import)
+        required: false
+        type: string
+        default: ''
 permissions:
   contents: read
   pull-requests: write
@@ -37,7 +42,7 @@ jobs:
 
 The only action input needed is `tfgit_secret`. tfgit supplies the playbook and PR number. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
 
-Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the pull request event, `workflow_dispatch` input, or `repository_dispatch` `client_payload.pull_request_number`.
+Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the `workflow_dispatch` input or `repository_dispatch` `client_payload.pull_request_number`. For a comment dispatch, the service passes the Terraform command in the optional `command` input and parsed arguments separately. Any Terraform subcommand and its options are accepted. The action executes the arguments without a shell and posts its output as a PR comment. The workflow must declare both inputs as shown above.
 
 By default, the action posts the tfgit secret and GitHub run context to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate`. On success, the service must return JSON in this shape. `playbook` is an ordered list of shell commands; tfgit runs each command in the downloaded PR workspace, stopping after the first failed command.
 

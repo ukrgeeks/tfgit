@@ -16,6 +16,7 @@ async function main() {
   const repoFullName = process.env.GITHUB_REPOSITORY;
   const workflowToken = process.env.GITHUB_TOKEN;
   const pullRequestNumber = readPullRequestNumber();
+  const command = readCommentCommand();
 
   if (!secret) fail('Input tfgit_secret is required.');
   if (!workspace || !repoFullName) {
@@ -34,6 +35,7 @@ async function main() {
         run_id: process.env.GITHUB_RUN_ID,
         run_attempt: process.env.GITHUB_RUN_ATTEMPT,
         pull_request_number: pullRequestNumber,
+        command,
       }),
     });
   } catch (error) {
@@ -51,10 +53,11 @@ async function main() {
   }
   console.log('tfgit secret validated.');
 
-  const playbook = validation.playbook;
   const prNumber = validation.pr_number || validation.pull_request_number;
-  if (!Array.isArray(playbook) || playbook.length === 0 || !playbook.every((command) => typeof command === 'string' && command.trim())) {
-    fail('tfgit response playbook must be a non-empty array of command strings.');
+  const requestedCommand = validation.command || '';
+  const commandArgs = validation.command_args;
+  if (Boolean(command) !== Boolean(requestedCommand)) {
+    fail('tfgit response command does not match the dispatched workflow input.');
   }
   if (!prNumber) {
     fail('tfgit response must include pr_number.');
@@ -73,6 +76,37 @@ async function main() {
     'x-github-api-version': '2022-11-28',
     'user-agent': 'tfgit-github-action',
   };
+
+  if (validation.unknown_command === true) {
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${encodeURIComponent(prNumber)}/comments`,
+      {
+        method: 'POST',
+        headers: { ...apiHeaders, 'content-type': 'application/json' },
+        body: JSON.stringify({
+          body: [
+            '### tfgit playbook output',
+            '',
+            'Unknown command. Start a PR comment with `terraform` followed by a Terraform command and its options.',
+          ].join('\n'),
+        }),
+      },
+    );
+    if (!response.ok) {
+      fail(`Could not post the unknown-command reply to pull request ${prNumber} (HTTP ${response.status}). Check that the workflow token has pull-requests: write permission.`);
+    }
+    console.log(`Posted an unknown-command reply to pull request ${prNumber}.`);
+    return;
+  }
+
+  const playbook = validation.playbook;
+  if (requestedCommand && (!Array.isArray(commandArgs) || commandArgs.length === 0
+    || !commandArgs.every((arg) => typeof arg === 'string'))) {
+    fail('tfgit response must include valid parsed Terraform command arguments.');
+  }
+  if (!Array.isArray(playbook) || playbook.length === 0 || !playbook.every((command) => typeof command === 'string' && command.trim())) {
+    fail('tfgit response playbook must be a non-empty array of command strings.');
+  }
 
   // The PR head ref is exposed through the base repository, so the workflow's
   // contents:read token can download it without needing access to a fork repo.
@@ -99,7 +133,10 @@ async function main() {
     try { fs.unlinkSync(archivePath); } catch {}
   }
 
-  const steps = runPlaybook(playbook, workspace);
+  if (requestedCommand && playbook[playbook.length - 1] !== requestedCommand) {
+    fail('tfgit response playbook must end with the requested Terraform command.');
+  }
+  const steps = runPlaybook(playbook, workspace, requestedCommand, commandArgs);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
@@ -124,6 +161,7 @@ async function main() {
   }
   const commentBody = [
     '### tfgit playbook output',
+    ...(requestedCommand ? [`Command: \`${requestedCommand}\``, ''] : []),
     `Run: ${runUrl}`,
     '',
     '````text',
@@ -155,14 +193,7 @@ async function main() {
 }
 
 function readPullRequestNumber() {
-  const eventPath = process.env.GITHUB_EVENT_PATH;
-  if (!eventPath) fail('GITHUB_EVENT_PATH is unavailable; run tfgit from a pull request workflow event.');
-  let event;
-  try {
-    event = JSON.parse(fs.readFileSync(eventPath, 'utf8'));
-  } catch {
-    fail('Could not read the GitHub event payload.');
-  }
+  const event = readEventPayload();
   const value = event.pull_request?.number
     ?? event.issue?.number
     ?? event.client_payload?.pull_request_number
@@ -174,18 +205,43 @@ function readPullRequestNumber() {
   return Number(value);
 }
 
-function runPlaybook(commands, workspace) {
+function readCommentCommand() {
+  const event = readEventPayload();
+  const value = event.inputs?.command ?? event.client_payload?.command ?? '';
+  return String(value).trim();
+}
+
+function readEventPayload() {
+  const eventPath = process.env.GITHUB_EVENT_PATH;
+  if (!eventPath) fail('GITHUB_EVENT_PATH is unavailable; run tfgit from a pull request workflow event.');
+  try {
+    return JSON.parse(fs.readFileSync(eventPath, 'utf8'));
+  } catch {
+    fail('Could not read the GitHub event payload.');
+  }
+}
+
+function runPlaybook(commands, workspace, commentCommand = '', commandArgs = []) {
   const results = [];
   for (const [index, command] of commands.entries()) {
     console.log(`Running tfgit playbook step ${index + 1}/${commands.length}: ${command}`);
-    const result = spawnSync(command, {
-      cwd: workspace,
-      env: process.env,
-      shell: true,
-      encoding: 'utf8',
-      maxBuffer: 20 * 1024 * 1024,
-      timeout: 30 * 60 * 1000,
-    });
+    const result = command === commentCommand
+      ? spawnSync('terraform', commandArgs, {
+        cwd: workspace,
+        env: process.env,
+        shell: false,
+        encoding: 'utf8',
+        maxBuffer: 20 * 1024 * 1024,
+        timeout: 30 * 60 * 1000,
+      })
+      : spawnSync(command, {
+        cwd: workspace,
+        env: process.env,
+        shell: true,
+        encoding: 'utf8',
+        maxBuffer: 20 * 1024 * 1024,
+        timeout: 30 * 60 * 1000,
+      });
     const output = [result.stdout, result.stderr, result.error?.message]
       .filter(Boolean)
       .join('\n')
