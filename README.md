@@ -2,6 +2,8 @@
 
 This action validates a tfgit secret, downloads the head of the pull request selected by tfgit, and posts the playbook output as a PR comment. It is designed for workflows started by tfgit through `workflow_dispatch` or `repository_dispatch`.
 
+The TFgit service can dispatch this workflow for pull request lifecycle events and when a repository owner, member, or collaborator adds a comment to an open PR. The service ignores its own output comment so it does not trigger another run.
+
 ```yaml
 name: tfgit
 on:
