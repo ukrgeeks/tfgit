@@ -1,5 +1,6 @@
 const fs = require('node:fs');
 const { spawnSync } = require('node:child_process');
+const path = require('node:path');
 
 function fail(message) {
   console.error(`::error::${message}`);
@@ -118,8 +119,30 @@ async function main() {
   if (!Array.isArray(playbook) || playbook.length === 0 || !playbook.every((command) => typeof command === 'string' && command.trim())) {
     fail('tfgit response playbook must be a non-empty array of command strings.');
   }
+  if (typeof validation.terraform_backend !== 'string' || validation.terraform_backend.length > 20000) {
+    fail('tfgit response terraform_backend must be a string of at most 20,000 characters.');
+  }
 
   console.log(`Running the playbook in the checked-out pull request ${prNumber} head.`);
+
+  const baseBranch = await getPullRequestBaseBranch(owner, repo, prNumber, apiHeaders);
+  const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+  const backendConfig = validation.terraform_backend
+    .replaceAll('${path.module}', hclString(workspace))
+    .replaceAll('${BASE_REPO_NAME}', hclString(repo))
+    .replaceAll('${BASE_BRANCH_NAME}', hclString(baseBranch))
+    .replaceAll('${AWS_DEFAULT_REGION}', hclString(process.env.AWS_DEFAULT_REGION || ''));
+  const backendFile = path.join(workspace, 'backend.tf');
+  try {
+    if (fs.lstatSync(backendFile).isSymbolicLink()) {
+      fail('Refusing to overwrite backend.tf because it is a symbolic link.');
+    }
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  fs.writeFileSync(backendFile, backendConfig, { encoding: 'utf8', mode: 0o600 });
+  fs.chmodSync(backendFile, 0o600);
+  console.log('Wrote Terraform backend configuration to backend.tf.');
 
   const mainPlaybook = requestedCommand ? [requestedCommand] : playbook;
   const commentCommandIndex = requestedCommand ? 0 : -1;
@@ -180,6 +203,21 @@ function readPullRequestNumber() {
     fail('The GitHub event must include a pull request number (pull_request_number for workflow_dispatch/repository_dispatch).');
   }
   return Number(value);
+}
+
+async function getPullRequestBaseBranch(owner, repo, prNumber, headers) {
+  const response = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(prNumber)}`,
+    { headers },
+  );
+  if (!response.ok) {
+    fail(`Could not read the pull request target branch (HTTP ${response.status}). Check pull-requests: read permission.`);
+  }
+  const pullRequest = await response.json();
+  if (typeof pullRequest.base?.ref !== 'string' || !pullRequest.base.ref) {
+    fail('GitHub did not return the pull request target branch.');
+  }
+  return pullRequest.base.ref;
 }
 
 function readCommentCommand() {
