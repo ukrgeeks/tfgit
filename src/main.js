@@ -122,27 +122,35 @@ async function main() {
   if (typeof validation.terraform_backend !== 'string' || validation.terraform_backend.length > 20000) {
     fail('tfgit response terraform_backend must be a string of at most 20,000 characters.');
   }
+  const backendEnabled = validation.terraform_backend_enabled === true;
+  if (validation.terraform_backend_enabled !== undefined && typeof validation.terraform_backend_enabled !== 'boolean') {
+    fail('tfgit response terraform_backend_enabled must be a boolean.');
+  }
 
   console.log(`Running the playbook in the checked-out pull request ${prNumber} head.`);
 
-  const baseBranch = await getPullRequestBaseBranch(owner, repo, prNumber, apiHeaders);
-  const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
-  const backendConfig = validation.terraform_backend
-    .replaceAll('${path.module}', hclString(workspace))
-    .replaceAll('${BASE_REPO_NAME}', hclString(repo))
-    .replaceAll('${BASE_BRANCH_NAME}', hclString(baseBranch))
-    .replaceAll('${AWS_DEFAULT_REGION}', hclString(process.env.AWS_DEFAULT_REGION || ''));
-  const backendFile = path.join(workspace, 'backend.tf');
-  try {
-    if (fs.lstatSync(backendFile).isSymbolicLink()) {
-      fail('Refusing to overwrite backend.tf because it is a symbolic link.');
+  if (backendEnabled) {
+    const baseBranch = await getPullRequestBaseBranch(owner, repo, prNumber, apiHeaders);
+    const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
+    const backendConfig = validation.terraform_backend
+      .replaceAll('${path.module}', hclString(workspace))
+      .replaceAll('${BASE_REPO_NAME}', hclString(repo))
+      .replaceAll('${BASE_BRANCH_NAME}', hclString(baseBranch))
+      .replaceAll('${AWS_DEFAULT_REGION}', hclString(process.env.AWS_DEFAULT_REGION || ''));
+    const backendFile = path.join(workspace, 'backend.tf');
+    try {
+      if (fs.lstatSync(backendFile).isSymbolicLink()) {
+        fail('Refusing to overwrite backend.tf because it is a symbolic link.');
+      }
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
     }
-  } catch (error) {
-    if (error.code !== 'ENOENT') throw error;
+    fs.writeFileSync(backendFile, backendConfig, { encoding: 'utf8', mode: 0o600 });
+    fs.chmodSync(backendFile, 0o600);
+    console.log('Wrote Terraform backend configuration to backend.tf.');
+  } else {
+    console.log('Terraform backend injection is disabled; leaving backend.tf unchanged.');
   }
-  fs.writeFileSync(backendFile, backendConfig, { encoding: 'utf8', mode: 0o600 });
-  fs.chmodSync(backendFile, 0o600);
-  console.log('Wrote Terraform backend configuration to backend.tf.');
 
   const mainPlaybook = requestedCommand ? [requestedCommand] : playbook;
   const commentCommandIndex = requestedCommand ? 0 : -1;
