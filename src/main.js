@@ -105,6 +105,12 @@ async function main() {
   }
 
   const playbook = validation.playbook;
+  const prePlaybook = validation.pre_playbook ?? ['terraform init'];
+  const postPlaybook = validation.post_playbook ?? [];
+  if (!Array.isArray(prePlaybook) || !prePlaybook.every((item) => typeof item === 'string' && item.trim())
+    || !Array.isArray(postPlaybook) || !postPlaybook.every((item) => typeof item === 'string' && item.trim())) {
+    fail('tfgit response pre_playbook and post_playbook must be arrays of non-empty command strings.');
+  }
   if (requestedCommand && (!Array.isArray(commandArgs) || commandArgs.length === 0
     || !commandArgs.every((arg) => typeof arg === 'string'))) {
     fail('tfgit response must include valid parsed Terraform command arguments.');
@@ -115,10 +121,11 @@ async function main() {
 
   console.log(`Running the playbook in the checked-out pull request ${prNumber} head.`);
 
-  if (requestedCommand && playbook[playbook.length - 1] !== requestedCommand) {
-    fail('tfgit response playbook must end with the requested Terraform command.');
-  }
-  const steps = runPlaybook(playbook, workspace, requestedCommand, commandArgs);
+  const commandsToRun = requestedCommand
+    ? [...prePlaybook, requestedCommand, ...postPlaybook]
+    : [...prePlaybook, ...playbook, ...postPlaybook];
+  const commentCommandIndex = requestedCommand ? prePlaybook.length : -1;
+  const steps = runPlaybook(commandsToRun, workspace, requestedCommand, commandArgs, commentCommandIndex);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
@@ -198,11 +205,11 @@ function readEventPayload() {
   }
 }
 
-function runPlaybook(commands, workspace, commentCommand = '', commandArgs = []) {
+function runPlaybook(commands, workspace, commentCommand = '', commandArgs = [], commentCommandIndex = -1) {
   const results = [];
   for (const [index, command] of commands.entries()) {
     console.log(`Running tfgit playbook step ${index + 1}/${commands.length}: ${command}`);
-    const result = command === commentCommand
+    const result = index === commentCommandIndex && command === commentCommand
       ? spawnSync('terraform', commandArgs, {
         cwd: workspace,
         env: process.env,
