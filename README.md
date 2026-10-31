@@ -42,7 +42,7 @@ jobs:
           tfgit_secret: ${{ secrets.TFGIT_SECRET }}
 ```
 
-The only action input needed is `tfgit_secret`. tfgit supplies the playbook and PR number. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
+The only action input needed is `tfgit_secret`. tfgit supplies the playbook and PR number. Before running commands, the action reads the PR through GitHub’s API and exports `GITHUB_PR_NUMBER`, `GITHUB_PR_BASE_BRANCH`, `GITHUB_PR_HEAD_BRANCH`, `GITHUB_PR_TITLE`, `GITHUB_PR_URL`, `GITHUB_PR_STATE`, `GITHUB_PR_AUTHOR`, `GITHUB_PR_BASE_REPOSITORY`, `GITHUB_PR_HEAD_REPOSITORY`, `GITHUB_PR_BASE_SHA`, `GITHUB_PR_HEAD_SHA`, and `GITHUB_PR_IS_DRAFT` to each playbook command. Use them like shell environment variables, for example `echo "$GITHUB_PR_BASE_BRANCH"`. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
 
 Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the `workflow_dispatch` input or `repository_dispatch` `client_payload.pull_request_number`. For a comment dispatch, the service passes the one-line Terraform command in the optional `tfgit_playbook` input and parsed arguments separately. Any Terraform subcommand and its options are accepted. The action executes the arguments without a shell and posts its output as a PR comment. The workflow must declare both inputs as shown above.
 

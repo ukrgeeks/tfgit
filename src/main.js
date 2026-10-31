@@ -129,8 +129,28 @@ async function main() {
 
   console.log(`Running the playbook in the checked-out pull request ${prNumber} head.`);
 
+  const pullRequest = await getPullRequestDetails(owner, repo, prNumber, apiHeaders);
+  const pullRequestEnvironment = {
+    GITHUB_PR_NUMBER: String(pullRequest.number),
+    GITHUB_PR_BASE_BRANCH: pullRequest.base.ref,
+    GITHUB_PR_HEAD_BRANCH: pullRequest.head.ref,
+    GITHUB_PR_TITLE: pullRequest.title || '',
+    GITHUB_PR_URL: pullRequest.html_url || '',
+    GITHUB_PR_STATE: pullRequest.state || '',
+    GITHUB_PR_AUTHOR: pullRequest.user?.login || '',
+    GITHUB_PR_BASE_REPOSITORY: pullRequest.base.repo?.full_name || '',
+    GITHUB_PR_HEAD_REPOSITORY: pullRequest.head.repo?.full_name || '',
+    GITHUB_PR_BASE_SHA: pullRequest.base.sha || '',
+    GITHUB_PR_HEAD_SHA: pullRequest.head.sha || '',
+    GITHUB_PR_IS_DRAFT: String(Boolean(pullRequest.draft)),
+  };
+  for (const [name, value] of Object.entries(pullRequestEnvironment)) {
+    process.env[name] = String(value).replaceAll('\0', '');
+  }
+  console.log(`Loaded pull request metadata for PR #${pullRequestEnvironment.GITHUB_PR_NUMBER}.`);
+
   if (backendEnabled) {
-    const baseBranch = await getPullRequestBaseBranch(owner, repo, prNumber, apiHeaders);
+    const baseBranch = pullRequestEnvironment.GITHUB_PR_BASE_BRANCH;
     const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
     const backendConfig = validation.terraform_backend
       .replaceAll('${path.module}', hclString(workspace))
@@ -213,19 +233,22 @@ function readPullRequestNumber() {
   return Number(value);
 }
 
-async function getPullRequestBaseBranch(owner, repo, prNumber, headers) {
+async function getPullRequestDetails(owner, repo, prNumber, headers) {
   const response = await fetch(
     `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(prNumber)}`,
     { headers },
   );
   if (!response.ok) {
-    fail(`Could not read the pull request target branch (HTTP ${response.status}). Check pull-requests: read permission.`);
+    fail(`Could not read pull request details (HTTP ${response.status}). Check pull-requests: read permission.`);
   }
   const pullRequest = await response.json();
   if (typeof pullRequest.base?.ref !== 'string' || !pullRequest.base.ref) {
     fail('GitHub did not return the pull request target branch.');
   }
-  return pullRequest.base.ref;
+  if (typeof pullRequest.head?.ref !== 'string' || !pullRequest.head.ref) {
+    fail('GitHub did not return the pull request source branch.');
+  }
+  return pullRequest;
 }
 
 function readCommentCommand() {
