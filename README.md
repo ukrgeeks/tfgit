@@ -59,7 +59,7 @@ By default, the action posts the tfgit secret and GitHub run context to `https:/
 }
 ```
 
-The workflow must check out `refs/pull/<number>/head` using `actions/checkout` before calling the action; this is the PR's feature branch head, not the workflow dispatch branch. The action runs in that checked-out workspace, executes playbook commands in order, and posts each command's output as a PR comment using `pull-requests: write`. If a command fails, later commands are skipped, the output is still commented, and the action fails. Override `service_url` or `validation_path` if the service uses a different endpoint.
+The workflow must check out `refs/pull/<number>/head` using `actions/checkout` before calling the action; this is the PR's feature branch head, not the workflow dispatch branch. The action runs in that checked-out workspace, executes playbook commands in order, and posts the output as one or more PR comments using `pull-requests: write`. ANSI terminal color/control sequences are removed from command output. Each output comment is collapsed by default; click **Expand to view output** to read it. Long output is split into parts instead of being truncated in the PR comments. If a command fails, later commands are skipped, the output is still commented, and the action fails. Override `service_url` or `validation_path` if the service uses a different endpoint.
 
 After running, the action also reports the run status, URL, and up to 60 KB of command output to `/api/v1/github-actions/report`. This data is displayed only in the owning user's Terraform dashboard.
 

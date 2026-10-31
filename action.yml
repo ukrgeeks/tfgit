@@ -1,5 +1,5 @@
 name: tfgit
-description: Validate a tfgit secret, load the customer's playbook, run it against a pull request, and comment the output
+description: Validate a tfgit secret, run the customer's playbook, and post collapsed output comments on the pull request
 author: UkrGeeks
 inputs:
   tfgit_secret:

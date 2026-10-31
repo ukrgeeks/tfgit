@@ -79,18 +79,22 @@ async function main() {
   };
 
   if (validation.unknown_command === true) {
+    const body = [
+      '### tfgit playbook output',
+      '',
+      '<details>',
+      '<summary>Expand to view reply</summary>',
+      '',
+      'Unknown command. Start a PR comment with `terraform` followed by a Terraform command and its options.',
+      '',
+      '</details>',
+    ].join('\n');
     const response = await fetch(
       `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${encodeURIComponent(prNumber)}/comments`,
       {
         method: 'POST',
         headers: { ...apiHeaders, 'content-type': 'application/json' },
-        body: JSON.stringify({
-          body: [
-            '### tfgit playbook output',
-            '',
-            'Unknown command. Start a PR comment with `terraform` followed by a Terraform command and its options.',
-          ].join('\n'),
-        }),
+        body: JSON.stringify({ body }),
       },
     );
     if (!response.ok) {
@@ -137,34 +141,21 @@ async function main() {
   } catch (error) {
     console.error(`::warning::Could not reach the tfgit dashboard to save run output: ${error.message}`);
   }
-  const commentBody = [
-    '### tfgit playbook output',
-    ...(requestedCommand ? [`Command: \`${requestedCommand}\``, ''] : []),
-    `Run: ${runUrl}`,
-    '',
-    '````text',
-    playbookOutput.slice(0, 60000),
-    '````',
-    ...(playbookOutput.length > 60000 ? ['', '_Output truncated to fit in a GitHub comment._'] : []),
-  ].join('\n');
-  const commentResponse = await fetch(
-    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${encodeURIComponent(prNumber)}/comments`,
-    {
-      method: 'POST',
-      headers: {
-        accept: 'application/vnd.github+json',
-        authorization: `Bearer ${workflowToken}`,
-        'content-type': 'application/json',
-        'x-github-api-version': '2022-11-28',
-        'user-agent': 'tfgit-github-action',
+  const commentBodies = buildOutputComments(playbookOutput, runUrl, requestedCommand);
+  for (const [index, body] of commentBodies.entries()) {
+    const commentResponse = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${encodeURIComponent(prNumber)}/comments`,
+      {
+        method: 'POST',
+        headers: apiHeaders,
+        body: JSON.stringify({ body }),
       },
-      body: JSON.stringify({ body: commentBody }),
-    },
-  );
-  if (!commentResponse.ok) {
-    fail(`Could not comment on pull request ${prNumber} (HTTP ${commentResponse.status}). Check that the workflow token has pull-requests: write permission.`);
+    );
+    if (!commentResponse.ok) {
+      fail(`Could not post output comment ${index + 1}/${commentBodies.length} to pull request ${prNumber} (HTTP ${commentResponse.status}). Check that the workflow token has pull-requests: write permission.`);
+    }
   }
-  console.log(`Posted playbook output to pull request ${prNumber}.`);
+  console.log(`Posted playbook output in ${commentBodies.length} collapsed comment${commentBodies.length === 1 ? '' : 's'} to pull request ${prNumber}.`);
   if (steps.some((step) => step.status !== 'success')) {
     fail('One or more tfgit playbook commands failed. See the pull request comment for output.');
   }
@@ -228,10 +219,10 @@ function runPlaybook(commands, workspace, commentCommand = '', commandArgs = [])
         maxBuffer: 20 * 1024 * 1024,
         timeout: 30 * 60 * 1000,
       });
-    const output = [result.stdout, result.stderr, result.error?.message]
+    const output = stripTerminalSequences([result.stdout, result.stderr, result.error?.message]
       .filter(Boolean)
       .join('\n')
-      .trim();
+      .trim());
     const status = !result.error && result.status === 0 ? 'success' : 'failure';
     results.push({ command, status, output: output || '(no output)' });
     if (status === 'failure') break;
@@ -244,6 +235,47 @@ function formatPlaybookOutput(steps) {
     `Step ${index + 1}: ${step.command} — ${step.status}`,
     step.output,
   ].join('\n')).join('\n\n');
+}
+
+function stripTerminalSequences(value) {
+  return value
+    // ANSI CSI styling/cursor sequences and OSC terminal metadata sequences.
+    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\u001B\][^\u0007]*(?:\u0007|\u001B\\)/g, '')
+    // Some log collectors render the ESC byte as U+FFFD; remove the same visible artifacts.
+    .replace(/\uFFFD\[[0-?]*[ -/]*[@-~]/g, '')
+    // Remove remaining terminal control characters while preserving tabs and newlines.
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '');
+}
+
+function buildOutputComments(output, runUrl, command = '') {
+  // Keep substantial headroom below GitHub's per-comment body limit for Markdown wrappers.
+  const chunkSize = 48000;
+  const chunks = [];
+  for (let offset = 0; offset < output.length;) {
+    let end = Math.min(offset + chunkSize, output.length);
+    // Do not split a UTF-16 surrogate pair between comments.
+    if (end < output.length && /[\uD800-\uDBFF]/.test(output[end - 1])) end -= 1;
+    chunks.push(output.slice(offset, end));
+    offset = end;
+  }
+  if (chunks.length === 0) chunks.push('(no output)');
+
+  return chunks.map((chunk, index) => [
+    `### tfgit playbook output${chunks.length > 1 ? ` — part ${index + 1}/${chunks.length}` : ''}`,
+    '',
+    '<details>',
+    `<summary>Expand to view output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
+    '',
+    ...(command ? [`Command: \`${command}\``, ''] : []),
+    `Run: ${runUrl}`,
+    '',
+    '````text',
+    chunk,
+    '````',
+    '',
+    '</details>',
+  ].join('\n'));
 }
 
 main().catch((error) => fail(error.message));
