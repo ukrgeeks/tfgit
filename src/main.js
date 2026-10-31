@@ -148,7 +148,8 @@ async function main() {
   } catch (error) {
     console.error(`::warning::Could not reach the tfgit dashboard to save run output: ${error.message}`);
   }
-  const commentBodies = buildOutputComments(playbookOutput, runUrl, requestedCommand);
+  const commentSummaries = summarizeTerraformResults(steps);
+  const commentBodies = buildOutputComments(playbookOutput, runUrl, requestedCommand, commentSummaries);
   for (const [index, body] of commentBodies.entries()) {
     const commentResponse = await fetch(
       `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${encodeURIComponent(prNumber)}/comments`,
@@ -255,7 +256,7 @@ function stripTerminalSequences(value) {
     .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '');
 }
 
-function buildOutputComments(output, runUrl, command = '') {
+function buildOutputComments(output, runUrl, command = '', summaries = []) {
   // Keep substantial headroom below GitHub's per-comment body limit for Markdown wrappers.
   const chunkSize = 48000;
   const chunks = [];
@@ -267,12 +268,12 @@ function buildOutputComments(output, runUrl, command = '') {
     offset = end;
   }
   if (chunks.length === 0) chunks.push('(no output)');
-
   return chunks.map((chunk, index) => [
     `### tfgit playbook output${chunks.length > 1 ? ` — part ${index + 1}/${chunks.length}` : ''}`,
     '',
+    ...(index === chunks.length - 1 && summaries.length ? [summaries.map((line) => `> ${line}`).join('\n'), ''] : []),
     '<details>',
-    `<summary>Expand to view output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
+    `<summary>Show Output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
     '',
     ...(command ? [`Command: \`${command}\``, ''] : []),
     `Run: ${runUrl}`,
@@ -283,6 +284,22 @@ function buildOutputComments(output, runUrl, command = '') {
     '',
     '</details>',
   ].join('\n'));
+}
+
+function summarizeTerraformResults(steps) {
+  const summaries = [];
+  const planWasRun = steps.some((step) => /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
+  if (planWasRun) {
+    const planSummary = steps.map((step) => step.output.match(/^Plan: \d+ to add, \d+ to change, \d+ to destroy\.$/m)?.[0]).find(Boolean);
+    if (planSummary) summaries.push(planSummary);
+  }
+
+  const successfulApply = steps.find((step) => step.status === 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
+  if (successfulApply) {
+    const applySummary = successfulApply.output.match(/^Apply complete! Resources:[^\r\n]*$/m)?.[0];
+    if (applySummary) summaries.push(applySummary);
+  }
+  return summaries;
 }
 
 main().catch((error) => fail(error.message));
