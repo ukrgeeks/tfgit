@@ -121,11 +121,10 @@ async function main() {
 
   console.log(`Running the playbook in the checked-out pull request ${prNumber} head.`);
 
-  const commandsToRun = requestedCommand
-    ? [...prePlaybook, requestedCommand, ...postPlaybook]
-    : [...prePlaybook, ...playbook, ...postPlaybook];
-  const commentCommandIndex = requestedCommand ? prePlaybook.length : -1;
-  const steps = runPlaybook(commandsToRun, workspace, requestedCommand, commandArgs, commentCommandIndex);
+  const mainPlaybook = requestedCommand ? [requestedCommand] : playbook;
+  const commentCommandIndex = requestedCommand ? 0 : -1;
+  const steps = runPlaybook(prePlaybook, mainPlaybook, postPlaybook, workspace,
+    requestedCommand, commandArgs, commentCommandIndex);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
@@ -207,34 +206,48 @@ function readEventPayload() {
   }
 }
 
-function runPlaybook(commands, workspace, commentCommand = '', commandArgs = [], commentCommandIndex = -1) {
+function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commentCommand = '', commandArgs = [], commentCommandIndex = -1) {
   const results = [];
-  for (const [index, command] of commands.entries()) {
-    console.log(`Running tfgit playbook step ${index + 1}/${commands.length}: ${command}`);
-    const result = index === commentCommandIndex && command === commentCommand
-      ? spawnSync('terraform', commandArgs, {
-        cwd: workspace,
-        env: process.env,
-        shell: false,
-        encoding: 'utf8',
-        maxBuffer: 20 * 1024 * 1024,
-        timeout: 30 * 60 * 1000,
-      })
-      : spawnSync(command, {
-        cwd: workspace,
-        env: process.env,
-        shell: true,
-        encoding: 'utf8',
-        maxBuffer: 20 * 1024 * 1024,
-        timeout: 30 * 60 * 1000,
-      });
-    const output = stripTerminalSequences([result.stdout, result.stderr, result.error?.message]
-      .filter(Boolean)
-      .join('\n')
-      .trim());
-    const status = !result.error && result.status === 0 ? 'success' : 'failure';
-    results.push({ command, status, output: output || '(no output)' });
-    if (status === 'failure') break;
+  const runStage = (commands, stage) => {
+    if (commands.length === 0) {
+      console.log(`Running tfgit ${stage} step 1/1: list is empty`);
+      return true;
+    }
+    for (const [index, command] of commands.entries()) {
+      const stageLabel = stage === 'playbook' ? 'playbook step' : `${stage} steps`;
+      console.log(`Running tfgit ${stageLabel} ${index + 1}/${commands.length}: ${command}`);
+      const result = stage === 'playbook' && index === commentCommandIndex && command === commentCommand
+        ? spawnSync('terraform', commandArgs, {
+          cwd: workspace,
+          env: process.env,
+          shell: false,
+          encoding: 'utf8',
+          maxBuffer: 20 * 1024 * 1024,
+          timeout: 30 * 60 * 1000,
+        })
+        : spawnSync(command, {
+          cwd: workspace,
+          env: process.env,
+          shell: true,
+          encoding: 'utf8',
+          maxBuffer: 20 * 1024 * 1024,
+          timeout: 30 * 60 * 1000,
+        });
+      const output = stripTerminalSequences([result.stdout, result.stderr, result.error?.message]
+        .filter(Boolean)
+        .join('\n')
+        .trim());
+      const status = !result.error && result.status === 0 ? 'success' : 'failure';
+      results.push({ command, status, output: output || '(no output)' });
+      if (status === 'failure') return false;
+    }
+    return true;
+  };
+
+  if (runStage(prePlaybook, 'pre-playbook')) {
+    if (runStage(playbook, 'playbook')) {
+      runStage(postPlaybook, 'post-playbook');
+    }
   }
   return results;
 }
