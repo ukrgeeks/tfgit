@@ -1,6 +1,6 @@
 # tfgit GitHub Action
 
-This action validates a tfgit secret, downloads the head of the pull request selected by tfgit, and posts the playbook output as a PR comment. It is designed for workflows started by tfgit through `workflow_dispatch` or `repository_dispatch`.
+This action validates a tfgit secret, runs the playbook in the checked-out pull request head, and posts the playbook output as a PR comment. It is designed for workflows started by tfgit through `workflow_dispatch` or `repository_dispatch`.
 
 The TFgit service dispatches this workflow for pull request lifecycle events and for comments on an open PR by a repository owner, member, or collaborator. Terraform command comments run after the saved setup steps. Comments that do not start with `terraform` get an `Unknown command` reply; the action's own output comment does not trigger another run.
 
@@ -26,6 +26,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ inputs.pull_request_number }}/head
 
       - name: Set up Terraform
         uses: hashicorp/setup-terraform@v3
@@ -57,7 +59,7 @@ By default, the action posts the tfgit secret and GitHub run context to `https:/
 }
 ```
 
-The action downloads the PR head through the base repository's `pull/<number>/head` ref using `contents: read`, runs the playbook commands in order, and posts each command's output as a PR comment using `pull-requests: write`. If a command fails, later commands are skipped, the output is still commented, and the action fails. Override `service_url` or `validation_path` if the service uses a different endpoint.
+The workflow must check out `refs/pull/<number>/head` using `actions/checkout` before calling the action; this is the PR's feature branch head, not the workflow dispatch branch. The action runs in that checked-out workspace, executes playbook commands in order, and posts each command's output as a PR comment using `pull-requests: write`. If a command fails, later commands are skipped, the output is still commented, and the action fails. Override `service_url` or `validation_path` if the service uses a different endpoint.
 
 After running, the action also reports the run status, URL, and up to 60 KB of command output to `/api/v1/github-actions/report`. This data is displayed only in the owning user's Terraform dashboard.
 

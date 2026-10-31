@@ -1,7 +1,5 @@
 const fs = require('node:fs');
-const os = require('node:os');
-const path = require('node:path');
-const { execFileSync, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
 
 function fail(message) {
   console.error(`::error::${message}`);
@@ -49,7 +47,10 @@ async function main() {
     fail(`tfgit returned a non-JSON response (HTTP ${validationResponse.status}).`);
   }
   if (!validationResponse.ok || validation.valid !== true) {
-    fail(validation.message || `tfgit rejected the secret (HTTP ${validationResponse.status}).`);
+    const reason = validation.detail || validation.message;
+    fail(reason
+      ? `tfgit validation failed (HTTP ${validationResponse.status}): ${reason}`
+      : `tfgit validation failed (HTTP ${validationResponse.status}).`);
   }
   console.log('tfgit secret validated.');
 
@@ -108,30 +109,7 @@ async function main() {
     fail('tfgit response playbook must be a non-empty array of command strings.');
   }
 
-  // The PR head ref is exposed through the base repository, so the workflow's
-  // contents:read token can download it without needing access to a fork repo.
-  const prHeadRef = encodeURIComponent(`pull/${prNumber}/head`);
-  const archiveUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tarball/${prHeadRef}`;
-  let archiveResponse;
-  try {
-    archiveResponse = await fetch(archiveUrl, { headers: apiHeaders, redirect: 'follow' });
-  } catch (error) {
-    fail(`Could not download pull request content: ${error.message}`);
-  }
-  if (!archiveResponse.ok) {
-    fail(`GitHub archive download failed (HTTP ${archiveResponse.status}). Check the workflow token has contents: read permission.`);
-  }
-
-  const archivePath = path.join(os.tmpdir(), `tfgit-pr-${process.pid}.tar.gz`);
-  try {
-    fs.writeFileSync(archivePath, Buffer.from(await archiveResponse.arrayBuffer()));
-    execFileSync('tar', ['-xzf', archivePath, '--strip-components=1', '-C', workspace], { stdio: 'inherit' });
-    console.log(`Downloaded pull request ${prNumber} head into ${workspace}.`);
-  } catch (error) {
-    fail(`Could not extract pull request content: ${error.message}`);
-  } finally {
-    try { fs.unlinkSync(archivePath); } catch {}
-  }
+  console.log(`Running the playbook in the checked-out pull request ${prNumber} head.`);
 
   if (requestedCommand && playbook[playbook.length - 1] !== requestedCommand) {
     fail('tfgit response playbook must end with the requested Terraform command.');
