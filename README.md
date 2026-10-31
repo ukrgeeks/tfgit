@@ -30,12 +30,12 @@ jobs:
           ref: refs/pull/${{ inputs.pull_request_number }}/head
 
       - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v3
+        uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "1.10.5"
 
       - name: Run tfgit
-        uses: ukrgeeks/tfgit@v1
+        uses: ukrgeeks/tfgit@main
         env:
           GITHUB_TOKEN: ${{ github.token }}
         with:
