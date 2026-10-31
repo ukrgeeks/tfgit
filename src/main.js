@@ -185,8 +185,16 @@ function readPullRequestNumber() {
 
 function readCommentCommand() {
   const event = readEventPayload();
-  const value = event.inputs?.command ?? event.client_payload?.command ?? '';
-  return String(value).trim();
+  const value = event.inputs?.tfgit_playbook
+    ?? event.client_payload?.tfgit_playbook
+    ?? event.inputs?.command
+    ?? event.client_payload?.command
+    ?? '';
+  const command = String(value).trim();
+  if (/[\r\n]/.test(command)) {
+    fail('Terraform commands from PR comments must fit on one line.');
+  }
+  return command;
 }
 
 function readEventPayload() {

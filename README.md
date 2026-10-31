@@ -2,7 +2,7 @@
 
 This action validates a tfgit secret, runs the playbook in the checked-out pull request head, and posts the playbook output as a PR comment. It is designed for workflows started by tfgit through `workflow_dispatch` or `repository_dispatch`.
 
-The TFgit service dispatches this workflow for pull request lifecycle events and for comments on an open PR by a repository owner, member, or collaborator. Terraform command comments run after the saved setup steps. Comments that do not start with `terraform` get an `Unknown command` reply; the action's own output comment does not trigger another run.
+When a PR opens, TFgit dispatches the workflow with no command, so the action runs the default playbook saved on tfgit.ukrgeeks.com. On an open PR, a repository owner, member, or collaborator can comment one single-line command beginning with `terraform`, such as `terraform plan -var-file=env/dev.tfvars`; TFgit runs the saved setup steps followed by that command. Multiline Terraform commands are rejected and not dispatched. Comments that do not start with `terraform` get an `Unknown command` reply; the action's own output comment does not trigger another run.
 
 ```yaml
 name: tfgit
@@ -10,31 +10,31 @@ on:
   workflow_dispatch:
     inputs:
       pull_request_number:
-        description: Pull request to run against
+        description: Pull request number selected by tfgit
         required: true
         type: number
-      command:
-        description: Optional PR comment command (terraform plan, apply, or import)
+      tfgit_playbook:
+        description: Terraform command from a PR comment
         required: false
         type: string
-        default: ''
+        default: ""
 permissions:
   contents: read
   pull-requests: write
 jobs:
-  run:
+  terraform:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           ref: refs/pull/${{ inputs.pull_request_number }}/head
 
-      - name: Set up Terraform
-        uses: hashicorp/setup-terraform@v4
+      - uses: hashicorp/setup-terraform@v4
         with:
           terraform_version: "1.10.5"
 
-      - name: Run tfgit
+      # Configure cloud credentials here if Terraform needs them.
+      - name: Run tfgit playbook
         uses: ukrgeeks/tfgit@main
         env:
           GITHUB_TOKEN: ${{ github.token }}
@@ -44,9 +44,9 @@ jobs:
 
 The only action input needed is `tfgit_secret`. tfgit supplies the playbook and PR number. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
 
-Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the `workflow_dispatch` input or `repository_dispatch` `client_payload.pull_request_number`. For a comment dispatch, the service passes the Terraform command in the optional `command` input and parsed arguments separately. Any Terraform subcommand and its options are accepted. The action executes the arguments without a shell and posts its output as a PR comment. The workflow must declare both inputs as shown above.
+Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the `workflow_dispatch` input or `repository_dispatch` `client_payload.pull_request_number`. For a comment dispatch, the service passes the one-line Terraform command in the optional `tfgit_playbook` input and parsed arguments separately. Any Terraform subcommand and its options are accepted. The action executes the arguments without a shell and posts its output as a PR comment. The workflow must declare both inputs as shown above.
 
-By default, the action posts the tfgit secret and GitHub run context to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate`. On success, the service must return JSON in this shape. `playbook` is an ordered list of shell commands; tfgit runs each command in the downloaded PR workspace, stopping after the first failed command.
+By default, the action posts the tfgit secret and GitHub run context to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate`. On success, the service must return JSON in this shape. `playbook` is an ordered list of shell commands; tfgit runs each command in the checked-out PR workspace, stopping after the first failed command.
 
 ```json
 {
@@ -63,4 +63,4 @@ The workflow must check out `refs/pull/<number>/head` using `actions/checkout` b
 
 After running, the action also reports the run status, URL, and up to 60 KB of command output to `/api/v1/github-actions/report`. This data is displayed only in the owning user's Terraform dashboard.
 
-The playbook is executable shell input and the action checks out/runs the PR head. Do not expose AWS/cloud credentials to this job for untrusted PRs. Review command output before sharing it in PR comments; Terraform output may contain sensitive values.
+The playbook is executable shell input and runs against the PR head. Do not expose AWS/cloud credentials to this job for untrusted PRs. Review command output before sharing it in PR comments; Terraform output may contain sensitive values.
