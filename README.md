@@ -33,11 +33,19 @@ jobs:
         with:
           terraform_version: "1.10.5"
 
-      # Configure cloud credentials here if Terraform needs them.
       - name: Run tfgit playbook
         uses: ukrgeeks/tfgit@main
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          # AWS credentials (uncomment and add these secrets to the repository):
+          # AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          # AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          # AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
+          # Azure service principal credentials (uncomment and add these secrets):
+          # ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
+          # ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
+          # ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+          # ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
         with:
           tfgit_secret: ${{ secrets.TFGIT_SECRET }}
 ```
