@@ -145,6 +145,11 @@ async function main() {
     GITHUB_PR_HEAD_SHA: pullRequest.head.sha || '',
     GITHUB_PR_IS_DRAFT: String(Boolean(pullRequest.draft)),
   };
+  const expandedCommandArgs = requestedCommand
+    ? commandArgs.map((argument) => argument
+      .replaceAll('${GITHUB_PR_BASE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH)
+      .replaceAll('${GITHUB_REPO_NAME}', pullRequestEnvironment.GITHUB_REPO_NAME))
+    : [];
   for (const [name, value] of Object.entries(pullRequestEnvironment)) {
     process.env[name] = String(value).replaceAll('\0', '');
   }
@@ -175,10 +180,13 @@ async function main() {
     console.log('Terraform backend injection is disabled; leaving backend.tf unchanged.');
   }
 
-  const mainPlaybook = requestedCommand ? [requestedCommand] : playbook;
+  const expandedCommentCommand = requestedCommand
+    ? `terraform ${expandedCommandArgs.map((argument) => /\s/.test(argument) ? JSON.stringify(argument) : argument).join(' ')}`
+    : '';
+  const mainPlaybook = requestedCommand ? [expandedCommentCommand] : playbook;
   const commentCommandIndex = requestedCommand ? 0 : -1;
   const steps = runPlaybook(prePlaybook, mainPlaybook, postPlaybook, workspace,
-    requestedCommand, commandArgs, commentCommandIndex);
+    expandedCommandArgs, commentCommandIndex);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
@@ -202,7 +210,7 @@ async function main() {
     console.error(`::warning::Could not reach the tfgit dashboard to save run output: ${error.message}`);
   }
   const commentSummaries = summarizeTerraformResults(steps);
-  const commentBodies = buildOutputComments(playbookOutput, runUrl, requestedCommand,
+  const commentBodies = buildOutputComments(playbookOutput, runUrl, expandedCommentCommand || requestedCommand,
     commentSummaries.lines, commentSummaries.errorLabel);
   for (const [index, body] of commentBodies.entries()) {
     const commentResponse = await fetch(
@@ -278,7 +286,7 @@ function readEventPayload() {
   }
 }
 
-function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commentCommand = '', commandArgs = [], commentCommandIndex = -1) {
+function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs = [], commentCommandIndex = -1) {
   const results = [];
   const runStage = (commands, stage) => {
     if (commands.length === 0) {
@@ -288,7 +296,7 @@ function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commentComm
     for (const [index, command] of commands.entries()) {
       const stageLabel = stage === 'playbook' ? 'playbook step' : `${stage} steps`;
       console.log(`Running tfgit ${stageLabel} ${index + 1}/${commands.length}: ${command}`);
-      const result = stage === 'playbook' && index === commentCommandIndex && command === commentCommand
+      const result = stage === 'playbook' && index === commentCommandIndex
         ? spawnSync('terraform', commandArgs, {
           cwd: workspace,
           env: process.env,
