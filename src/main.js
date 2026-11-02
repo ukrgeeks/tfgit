@@ -131,6 +131,7 @@ async function main() {
 
   const pullRequest = await getPullRequestDetails(owner, repo, prNumber, apiHeaders);
   const pullRequestEnvironment = {
+    GITHUB_REPO_NAME: repo,
     GITHUB_PR_NUMBER: String(pullRequest.number),
     GITHUB_PR_BASE_BRANCH: pullRequest.base.ref,
     GITHUB_PR_HEAD_BRANCH: pullRequest.head.ref,
@@ -154,6 +155,8 @@ async function main() {
     const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
     const backendConfig = validation.terraform_backend
       .replaceAll('${path.module}', hclString(workspace))
+      .replaceAll('${GITHUB_REPO_NAME}', hclString(repo))
+      .replaceAll('${GITHUB_PR_BASE_BRANCH}', hclString(baseBranch))
       .replaceAll('${BASE_REPO_NAME}', hclString(repo))
       .replaceAll('${BASE_BRANCH_NAME}', hclString(baseBranch))
       .replaceAll('${AWS_DEFAULT_REGION}', hclString(process.env.AWS_DEFAULT_REGION || ''));

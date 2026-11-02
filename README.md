@@ -64,3 +64,5 @@ The workflow must check out `refs/pull/<number>/head` using `actions/checkout` b
 After running, the action also reports the run status, URL, and up to 60 KB of command output to `/api/v1/github-actions/report`. This data is displayed only in the owning user's Terraform dashboard.
 
 The playbook is executable shell input and runs against the PR head. Do not expose AWS/cloud credentials to this job for untrusted PRs. Review command output before sharing it in PR comments; Terraform output may contain sensitive values.
+
+The action also exports `GITHUB_REPO_NAME` (the repository name without its owner) to every playbook command. Backend templates can use `${GITHUB_REPO_NAME}` and `${GITHUB_PR_BASE_BRANCH}` as placeholders; TFgit replaces them with the repository name and PR target branch when generating `backend.tf`.
