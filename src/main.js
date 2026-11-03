@@ -407,6 +407,8 @@ function summarizeTerraformResults(steps) {
       summaries.push(planLine);
     } else if (planLine) {
       summaries.push(planLine);
+      summaries.push('- ▶️ To apply this plan, comment:');
+      summaries.push('```text\nterraform apply\n```');
     }
   }
 
