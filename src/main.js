@@ -366,7 +366,7 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
     `### tfgit playbook output${chunks.length > 1 ? ` — part ${index + 1}/${chunks.length}` : ''}`,
     '',
     ...(errorLabel ? [`**${errorLabel}**`, ''] : []),
-    ...(index === chunks.length - 1 && summaries.length ? [summaries.map((line) => `> ${line}`).join('\n'), ''] : []),
+    ...(index === chunks.length - 1 && summaries.length ? [summaries.join('\n\n'), ''] : []),
     '<details>',
     `<summary>Show Output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
     '',
@@ -386,16 +386,33 @@ function summarizeTerraformResults(steps) {
   const failedPlan = steps.find((step) => step.status !== 'success' && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
   const failedApply = steps.find((step) => step.status !== 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
   const errorLabel = failedPlan ? 'Plan Error' : failedApply ? 'Apply Error' : '';
-  const successfulPlan = steps.find((step) => step.status === 'success' && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
+  const planSummaryPattern = /Plan:\s*(\d+)\s+to add,\s*(\d+)\s+to change,\s*(\d+)\s+to destroy\./;
+  const successfulPlan = steps.find((step) => step.status === 'success'
+    && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command)
+    && planSummaryPattern.test(step.output));
   if (successfulPlan) {
-    const planSummary = successfulPlan.output.match(/^Plan: \d+ to add, \d+ to change, \d+ to destroy\.$/m)?.[0];
-    if (planSummary) summaries.push(planSummary);
+    const counts = successfulPlan.output.match(planSummaryPattern);
+    const planLine = `Plan: ${counts[1]} to add, ${counts[2]} to change, ${counts[3]} to destroy.`;
+    if (counts.slice(1).every((count) => Number(count) === 0)) {
+      summaries.push([
+        '```text',
+        'No changes. Your infrastructure matches the configuration.',
+        '',
+        'Terraform has compared your real infrastructure against your configuration',
+        'and found no differences, so no changes are needed.',
+        '',
+        planLine,
+        '```',
+      ].join('\n'));
+    } else {
+      summaries.push(`> ${planLine}`);
+    }
   }
 
   const successfulApply = steps.find((step) => step.status === 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
   if (successfulApply) {
     const applySummary = successfulApply.output.match(/^Apply complete! Resources:[^\r\n]*$/m)?.[0];
-    if (applySummary) summaries.push(applySummary);
+    if (applySummary) summaries.push(`> ${applySummary}`);
   }
   return { lines: summaries, errorLabel };
 }
