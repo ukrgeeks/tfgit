@@ -366,7 +366,6 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
     `### tfgit playbook output${chunks.length > 1 ? ` — part ${index + 1}/${chunks.length}` : ''}`,
     '',
     ...(errorLabel ? [`**${errorLabel}**`, ''] : []),
-    ...(index === chunks.length - 1 && summaries.length ? [summaries.join('\n\n'), ''] : []),
     '<details>',
     `<summary>Show Output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
     '',
@@ -378,6 +377,7 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
     '````',
     '',
     '</details>',
+    ...(index === chunks.length - 1 && summaries.length ? ['', summaries.join('\n\n')] : []),
   ].join('\n'));
 }
 
@@ -397,24 +397,23 @@ function summarizeTerraformResults(steps) {
       : noChanges ? 'Plan: 0 to add, 0 to change, 0 to destroy.' : '';
     if (planLine && (noChanges || (counts && counts.slice(1).every((count) => Number(count) === 0)))) {
       summaries.push([
-        '```text',
+        '```sql',
         'No changes. Your infrastructure matches the configuration.',
         '',
         'Terraform has compared your real infrastructure against your configuration',
         'and found no differences, so no changes are needed.',
-        '',
-        planLine,
         '```',
       ].join('\n'));
+      summaries.push(planLine);
     } else if (planLine) {
-      summaries.push(`> ${planLine}`);
+      summaries.push(planLine);
     }
   }
 
   const successfulApply = steps.find((step) => step.status === 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
   if (successfulApply) {
     const applySummary = successfulApply.output.match(/^Apply complete! Resources:[^\r\n]*$/m)?.[0];
-    if (applySummary) summaries.push(`> ${applySummary}`);
+    if (applySummary) summaries.push(applySummary);
   }
   return { lines: summaries, errorLabel };
 }
