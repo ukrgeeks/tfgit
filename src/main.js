@@ -386,9 +386,9 @@ function summarizeTerraformResults(steps) {
   const failedPlan = steps.find((step) => step.status !== 'success' && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
   const failedApply = steps.find((step) => step.status !== 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
   const errorLabel = failedPlan ? 'Plan Error' : failedApply ? 'Apply Error' : '';
-  const planWasRun = !failedPlan && steps.some((step) => /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
-  if (planWasRun) {
-    const planSummary = steps.map((step) => step.output.match(/^Plan: \d+ to add, \d+ to change, \d+ to destroy\.$/m)?.[0]).find(Boolean);
+  const successfulPlan = steps.find((step) => step.status === 'success' && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
+  if (successfulPlan) {
+    const planSummary = successfulPlan.output.match(/^Plan: \d+ to add, \d+ to change, \d+ to destroy\.$/m)?.[0];
     if (planSummary) summaries.push(planSummary);
   }
 
