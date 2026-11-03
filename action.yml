@@ -3,8 +3,8 @@ description: Validate a tfgit secret, run the customer's playbook, and post coll
 author: UkrGeeks
 inputs:
   tfgit_secret:
-    description: Secret used to authenticate with tfgit
-    required: true
+    description: Secret used to authenticate with tfgit (or set TFGIT_SECRET in the step environment)
+    required: false
   service_url:
     description: Base URL of the tfgit service
     required: false
