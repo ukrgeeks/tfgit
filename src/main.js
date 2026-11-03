@@ -387,13 +387,15 @@ function summarizeTerraformResults(steps) {
   const failedApply = steps.find((step) => step.status !== 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
   const errorLabel = failedPlan ? 'Plan Error' : failedApply ? 'Apply Error' : '';
   const planSummaryPattern = /Plan:\s*(\d+)\s+to add,\s*(\d+)\s+to change,\s*(\d+)\s+to destroy\./i;
-  // Terraform may print the summary with surrounding runner output or formatting;
-  // identify it from successful command output rather than relying on an exact command string.
-  const successfulPlan = steps.find((step) => step.status === 'success' && planSummaryPattern.test(step.output));
+  const successfulPlan = steps.find((step) => step.status === 'success'
+    && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
   if (successfulPlan) {
     const counts = successfulPlan.output.match(planSummaryPattern);
-    const planLine = `Plan: ${counts[1]} to add, ${counts[2]} to change, ${counts[3]} to destroy.`;
-    if (counts.slice(1).every((count) => Number(count) === 0)) {
+    const noChanges = /No changes\. Your infrastructure matches the configuration\./i.test(successfulPlan.output);
+    const planLine = counts
+      ? `Plan: ${counts[1]} to add, ${counts[2]} to change, ${counts[3]} to destroy.`
+      : noChanges ? 'Plan: 0 to add, 0 to change, 0 to destroy.' : '';
+    if (planLine && (noChanges || (counts && counts.slice(1).every((count) => Number(count) === 0)))) {
       summaries.push([
         '```text',
         'No changes. Your infrastructure matches the configuration.',
@@ -404,7 +406,7 @@ function summarizeTerraformResults(steps) {
         planLine,
         '```',
       ].join('\n'));
-    } else {
+    } else if (planLine) {
       summaries.push(`> ${planLine}`);
     }
   }
