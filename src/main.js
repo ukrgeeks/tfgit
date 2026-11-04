@@ -403,9 +403,13 @@ async function checkoutPullRequestHead(owner, repo, headSha, headers, workspace)
       return 'GitHub returned an unsafe repository archive';
     }
 
-    const workspacePath = clearWorkspaceContents(workspace);
+    const workspacePath = path.resolve(workspace);
+    if (!workspacePath || workspacePath === path.parse(workspacePath).root) {
+      return 'refusing to extract into a filesystem root';
+    }
+    fs.mkdirSync(workspacePath, { recursive: true });
     const extract = spawnSync('tar', [
-      '-xzf', archive, '-C', workspacePath, '--strip-components=1', '--no-same-owner', '--no-same-permissions',
+      '-xzf', archive, '-C', workspacePath, '--strip-components=1', '--overwrite', '--no-same-owner', '--no-same-permissions',
     ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 });
     if (extract.error || extract.status !== 0) return extract.stderr?.trim() || 'archive extraction failed';
     return '';
