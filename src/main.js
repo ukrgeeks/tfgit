@@ -331,7 +331,10 @@ async function saveWorkspace(serviceUrl, storageToken, workspace, headSha) {
       cwd: workspace, encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024,
     });
     if (tar.error || tar.status !== 0) return tar.stderr || tar.error?.message || 'archive creation failed';
-    if (fs.statSync(archive).size > MAX_STORAGE_ARCHIVE_BYTES) return 'archive exceeds the 1 GiB limit';
+    const archiveSize = fs.statSync(archive).size;
+    console.log(`Terraform workspace archive size: ${formatBytes(archiveSize)}.`);
+    if (archiveSize > MAX_STORAGE_ARCHIVE_BYTES) return 'archive exceeds the 1 GiB limit';
+    console.log('Uploading workspace archive to TFgit storage...');
     const put = spawnSync('curl', [
       '--fail', '--silent', '--show-error', '--location', '-X', 'PUT',
       '-H', `Authorization: Bearer ${storageToken}`, '-H', `X-TFgit-PR-Head-SHA: ${headSha}`,
@@ -346,6 +349,12 @@ async function saveWorkspace(serviceUrl, storageToken, workspace, headSha) {
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+}
+
+function formatBytes(bytes) {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 function collectWorkspaceFiles(workspace) {
