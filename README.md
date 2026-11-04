@@ -50,7 +50,7 @@ Set `TFGIT_SECRET` from the repository Actions secret and `TFGIT_URL` to your TF
 
 Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the `workflow_dispatch` input or `repository_dispatch` `client_payload.pull_request_number`. For a comment dispatch, the service passes the one-line Terraform command in the optional `tfgit_playbook` input and parsed arguments separately. Any Terraform subcommand and its options are accepted. The action executes the arguments without a shell and posts its output as a PR comment. The workflow must declare both inputs as shown above.
 
-By default, the action posts the tfgit secret and GitHub run context to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate`. On success, the service must return JSON in this shape. `playbook` is an ordered list of shell commands; tfgit runs each command in the PR workspace, stopping after the first failed command.
+By default, the action posts the tfgit secret and GitHub run context to `https://tfgit.ukrgeeks.com/api/v1/github-actions/validate`. On success, the service must return JSON in this shape. `playbook_name` is `Default` or the selected repository playbook's name. The action prints the selected name in the workflow log. `playbook` is an ordered list of shell commands; tfgit runs each command in the PR workspace, stopping after the first failed command.
 
 ```json
 {
@@ -59,6 +59,7 @@ By default, the action posts the tfgit secret and GitHub run context to `https:/
     "terraform init",
     "terraform plan -var-file=env/dev.tfvars"
   ],
+  "playbook_name": "Default",
   "pr_number": 123
 }
 ```

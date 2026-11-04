@@ -114,6 +114,7 @@ async function main() {
   }
 
   const playbook = validation.playbook;
+  const playbookName = validation.playbook_name || 'Default';
   const prePlaybook = validation.pre_playbook ?? ['terraform init'];
   const postPlaybook = validation.post_playbook ?? [];
   if (!Array.isArray(prePlaybook) || !prePlaybook.every((item) => typeof item === 'string' && item.trim())
@@ -127,6 +128,9 @@ async function main() {
   if (!Array.isArray(playbook) || playbook.length === 0 || !playbook.every((command) => typeof command === 'string' && command.trim())) {
     fail('tfgit response playbook must be a non-empty array of command strings.');
   }
+  if (typeof playbookName !== 'string' || !/^[A-Za-z0-9]{1,32}$/.test(playbookName)) {
+    fail('tfgit response playbook_name must contain 1–32 letters or digits.');
+  }
   if (typeof validation.terraform_backend !== 'string' || validation.terraform_backend.length > 20000) {
     fail('tfgit response terraform_backend must be a string of at most 20,000 characters.');
   }
@@ -136,6 +140,7 @@ async function main() {
   }
 
   const pullRequest = await getPullRequestDetails(owner, repo, prNumber, apiHeaders);
+  console.log(`Using playbook: ${playbookName}.`);
   const pullRequestEnvironment = {
     GITHUB_REPO_NAME: repo,
     GITHUB_PR_NUMBER: String(pullRequest.number),
