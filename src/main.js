@@ -380,6 +380,9 @@ async function clearWorkspaceBeforePlan(serviceUrl, storageToken) {
     const response = await fetch(storageUrl(serviceUrl), {
       method: 'DELETE', headers: { authorization: `Bearer ${storageToken}` },
     });
+    if (!response.ok && response.status === 404) {
+      return 'HTTP 404 from the storage endpoint; route /storage directly to the storage service, preserve the path, and ensure the deployed service has DELETE /storage. The storage API returns HTTP 200 when the PR folder is already absent';
+    }
     if (!response.ok) return `storage returned HTTP ${response.status}`;
     return '';
   } catch (error) {
