@@ -1,9 +1,14 @@
 const fs = require('node:fs');
 const os = require('node:os');
+const crypto = require('node:crypto');
 const { spawnSync } = require('node:child_process');
 const path = require('node:path');
+const { createReadStream, createWriteStream } = require('node:fs');
+const { pipeline } = require('node:stream/promises');
 
 const MAX_STORAGE_ARCHIVE_BYTES = 1024 * 1024 * 1024;
+const ENCRYPTED_ARCHIVE_MAGIC = Buffer.from('TFGITENC1');
+const ENCRYPTED_ARCHIVE_HEADER_SIZE = ENCRYPTED_ARCHIVE_MAGIC.length + 16 + 12 + 16;
 
 function fail(message) {
   console.error(`::error::${message}`);
@@ -130,8 +135,6 @@ async function main() {
     fail('tfgit response terraform_backend_enabled must be a boolean.');
   }
 
-  console.log(`Running the playbook in the checked-out pull request ${prNumber} head.`);
-
   const pullRequest = await getPullRequestDetails(owner, repo, prNumber, apiHeaders);
   const pullRequestEnvironment = {
     GITHUB_REPO_NAME: repo,
@@ -158,6 +161,44 @@ async function main() {
   }
   console.log(`Loaded pull request metadata for PR #${pullRequestEnvironment.GITHUB_PR_NUMBER}.`);
 
+  const expandedCommentCommand = requestedCommand
+    ? `terraform ${expandedCommandArgs.map((argument) => /\s/.test(argument) ? JSON.stringify(argument) : argument).join(' ')}`
+    : '';
+  const mainPlaybook = requestedCommand ? [expandedCommentCommand] : playbook;
+  const commentCommandIndex = requestedCommand ? 0 : -1;
+  const planIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
+    .some((item) => /^\s*terraform\s+plan(?:\s|$)/i.test(item));
+  const applyIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
+    .some((item) => /^\s*terraform\s+apply(?:\s|$)/i.test(item));
+  const useSavedWorkspace = applyIsRequested && !planIsRequested;
+  if (useSavedWorkspace) {
+    const restored = await restoreWorkspace(serviceUrl, validation.storage_token, workspace, prNumber,
+      pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName);
+    if (restored.missing) {
+      await reportRunState(serviceUrl, {
+        secret,
+        repository: repoFullName,
+        pull_request_number: Number(prNumber),
+        run_id: process.env.GITHUB_RUN_ID || '',
+        run_attempt: process.env.GITHUB_RUN_ATTEMPT || '1',
+        status: 'failure',
+        output: 'There is no saved plan for this pull request. Please execute `terraform plan` first.',
+        run_url: `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+        plan_ready: false,
+        apply_success: false,
+      });
+      await postPullRequestComment(owner, repo, prNumber, apiHeaders,
+        'There is no saved plan for this pull request. Please execute `terraform plan` first.');
+      fail('No saved plan was found for this pull request. Run terraform plan first.');
+    }
+    if (restored.error) fail(`Could not restore the saved Terraform workspace: ${restored.error}`);
+  } else {
+    console.log(`Fetching pull request ${prNumber} head ${pullRequestEnvironment.GITHUB_PR_HEAD_SHA} into the runner workspace.`);
+    const checkoutError = await checkoutPullRequestHead(owner, repo, pullRequestEnvironment.GITHUB_PR_HEAD_SHA,
+      apiHeaders, workspace);
+    if (checkoutError) fail(`Could not fetch the pull request workspace: ${checkoutError}`);
+  }
+
   if (backendEnabled) {
     const baseBranch = pullRequestEnvironment.GITHUB_PR_BASE_BRANCH;
     const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
@@ -182,43 +223,27 @@ async function main() {
   } else {
     console.log('Terraform backend injection is disabled; leaving backend.tf unchanged.');
   }
-
-  const expandedCommentCommand = requestedCommand
-    ? `terraform ${expandedCommandArgs.map((argument) => /\s/.test(argument) ? JSON.stringify(argument) : argument).join(' ')}`
-    : '';
-  const mainPlaybook = requestedCommand ? [expandedCommentCommand] : playbook;
-  const commentCommandIndex = requestedCommand ? 0 : -1;
-  const planIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
-    .some((item) => /^\s*terraform\s+plan(?:\s|$)/i.test(item));
-  const applyIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
-    .some((item) => /^\s*terraform\s+apply(?:\s|$)/i.test(item));
   if (planIsRequested && validation.storage_token) {
     const clearError = await clearWorkspaceBeforePlan(serviceUrl, validation.storage_token);
     if (clearError) fail(`Could not invalidate the previous saved plan before starting Terraform plan: ${clearError}`);
   }
-  if (applyIsRequested) {
-    const restored = await restoreWorkspace(serviceUrl, validation.storage_token, workspace, prNumber,
-      pullRequestEnvironment.GITHUB_PR_HEAD_SHA);
-    if (restored.missing) {
-      await postPullRequestComment(owner, repo, prNumber, apiHeaders,
-        'There is no saved plan for this pull request. Please execute `terraform plan` first.');
-      fail('No saved plan was found for this pull request. Run terraform plan first.');
-    }
-    if (restored.error) fail(`Could not restore the saved Terraform workspace: ${restored.error}`);
-  }
+  const commandEnvironment = { ...process.env };
+  delete commandEnvironment.TFGIT_SECRET;
+  delete commandEnvironment.INPUT_TFGIT_SECRET;
+  delete commandEnvironment.GITHUB_TOKEN;
   const steps = runPlaybook(prePlaybook, mainPlaybook, postPlaybook, workspace,
-    expandedCommandArgs, commentCommandIndex);
+    expandedCommandArgs, commentCommandIndex, commandEnvironment);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
   let storageTransferFailed = false;
   const planSteps = steps.filter((step) => /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
   const successfulPlan = planSteps.length > 0 && planSteps.at(-1).status === 'success';
-  const successfulApply = steps.some((step) => step.status === 'success'
-    && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
+  const applySteps = steps.filter((step) => /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
+  const successfulApply = applySteps.length > 0 && applySteps.at(-1).status === 'success';
   if (successfulPlan) {
     const storageError = await saveWorkspace(serviceUrl, validation.storage_token, workspace,
-      pullRequestEnvironment.GITHUB_PR_HEAD_SHA);
+      pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName, prNumber);
     if (storageError) {
       storageTransferFailed = true;
       console.error(`::warning::Could not save the Terraform workspace: ${storageError}`);
@@ -226,7 +251,7 @@ async function main() {
         'TFgit could not save this plan workspace. Apply will be unavailable until a plan is saved successfully.');
     }
   }
-  if (successfulApply && runStatus === 'success') await deleteWorkspace(serviceUrl, validation.storage_token);
+  if (successfulApply) await deleteWorkspace(serviceUrl, validation.storage_token);
   try {
     const reportResponse = await fetch(new URL('/api/v1/github-actions/report', serviceUrl), {
       method: 'POST',
@@ -238,6 +263,10 @@ async function main() {
         run_id: process.env.GITHUB_RUN_ID || '',
         run_attempt: process.env.GITHUB_RUN_ATTEMPT || '1',
         status: storageTransferFailed ? 'failure' : runStatus,
+        plan_ready: successfulApply
+          ? false
+          : (planIsRequested ? successfulPlan && !storageTransferFailed : null),
+        apply_success: applyIsRequested ? successfulApply : (planIsRequested ? false : null),
         output: (storageTransferFailed
           ? `${playbookOutput}\n\nTFgit could not save the workspace; apply is unavailable until a plan is saved successfully.`
           : playbookOutput).slice(0, 60000),
@@ -279,18 +308,32 @@ async function postPullRequestComment(owner, repo, prNumber, headers, body) {
   if (!response.ok) fail(`Could not post a comment to pull request ${prNumber} (HTTP ${response.status}).`);
 }
 
+async function reportRunState(serviceUrl, report) {
+  try {
+    const response = await fetch(new URL('/api/v1/github-actions/report', serviceUrl), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', accept: 'application/json' },
+      body: JSON.stringify(report),
+    });
+    if (!response.ok) console.error(`::warning::Could not update PR run status in the TFgit dashboard (HTTP ${response.status}).`);
+  } catch (error) {
+    console.error(`::warning::Could not reach the TFgit dashboard to update PR run status: ${error.message}`);
+  }
+}
+
 function storageUrl(serviceUrl) {
   return new URL('/storage', serviceUrl);
 }
 
-async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, headSha) {
+async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, headSha, secret, repoFullName) {
   if (!storageToken) return { error: 'storage is not configured; set STORAGE_SECRET on the backend and storage service' };
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tfgit-storage-'));
+  const encryptedArchive = path.join(tempDir, 'workspace.tfgit.enc');
   const archive = path.join(tempDir, 'workspace.tar.gz');
   try {
     const result = spawnSync('curl', [
       '--silent', '--show-error', '--location', '--max-filesize', String(MAX_STORAGE_ARCHIVE_BYTES),
-      '--output', archive, '--write-out', '%{http_code}',
+      '--output', encryptedArchive, '--write-out', '%{http_code}',
       '-H', `Authorization: Bearer ${storageToken}`, '-H', `X-TFgit-PR-Head-SHA: ${headSha}`,
       storageUrl(serviceUrl).toString(),
     ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 });
@@ -298,13 +341,15 @@ async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, h
     const status = Number(result.stdout.trim());
     if (status === 404) return { missing: true };
     if (result.status !== 0 || status !== 200) return { error: `storage returned HTTP ${status || result.status}` };
-    if (fs.statSync(archive).size > MAX_STORAGE_ARCHIVE_BYTES) return { error: 'archive exceeds the 1 GiB limit' };
+    if (fs.statSync(encryptedArchive).size > MAX_STORAGE_ARCHIVE_BYTES) return { error: 'encrypted archive exceeds the 1 GiB limit' };
+    await decryptArchive(encryptedArchive, archive, secret, archiveScope(repoFullName, prNumber, headSha));
     const listing = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8', timeout: 2 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
     if (listing.error || listing.status !== 0) return { error: 'could not inspect the saved workspace archive' };
     const entries = listing.stdout.split('\n').filter(Boolean);
     if (!entries.length || entries.some((entry) => path.isAbsolute(entry) || entry.includes('\\') || entry.split('/').includes('..'))) {
       return { error: 'archive contains an unsafe path' };
     }
+    clearWorkspaceContents(workspace);
     const extract = spawnSync('tar', ['-xzf', archive, '-C', workspace, '--no-same-owner', '--no-same-permissions'], {
       encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024,
     });
@@ -318,10 +363,71 @@ async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, h
   }
 }
 
-async function saveWorkspace(serviceUrl, storageToken, workspace, headSha) {
+async function checkoutPullRequestHead(owner, repo, headSha, headers, workspace) {
+  if (!/^[0-9a-f]{40}$/i.test(String(headSha))) return 'GitHub returned an invalid pull request head SHA';
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tfgit-checkout-'));
+  const archive = path.join(tempDir, 'pull-request.tar.gz');
+  try {
+    const archiveUrl = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/tarball/${encodeURIComponent(headSha)}`;
+    const download = spawnSync('curl', [
+      '--silent', '--show-error', '--location', '--max-filesize', String(MAX_STORAGE_ARCHIVE_BYTES),
+      '--output', archive, '--write-out', '%{http_code}',
+      '-H', `Authorization: ${headers.authorization}`,
+      '-H', 'Accept: application/vnd.github+json',
+      '-H', 'X-GitHub-Api-Version: 2022-11-28',
+      archiveUrl,
+    ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 });
+    const status = Number(download.stdout.trim());
+    if (download.error) return download.error.message;
+    if (download.status !== 0 || status !== 200) {
+      return `GitHub returned HTTP ${status || download.status}${download.stderr ? `: ${download.stderr.trim()}` : ''}`;
+    }
+    if (!fs.existsSync(archive) || fs.statSync(archive).size === 0) return 'GitHub returned an empty repository archive';
+
+    const listing = spawnSync('tar', ['-tzf', archive], {
+      encoding: 'utf8', timeout: 2 * 60 * 1000, maxBuffer: 64 * 1024 * 1024,
+    });
+    if (listing.error || listing.status !== 0) return 'could not inspect the pull request archive';
+    const entries = listing.stdout.split('\n').filter(Boolean);
+    const roots = new Set();
+    if (!entries.length || entries.some((entry) => {
+      const parts = entry.split('/');
+      roots.add(parts[0]);
+      return path.isAbsolute(entry) || entry.includes('\\') || parts.includes('..') || parts.length < 2;
+    }) || roots.size !== 1) {
+      return 'GitHub returned an unsafe repository archive';
+    }
+
+    const workspacePath = clearWorkspaceContents(workspace);
+    const extract = spawnSync('tar', [
+      '-xzf', archive, '-C', workspacePath, '--strip-components=1', '--no-same-owner', '--no-same-permissions',
+    ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 4 * 1024 * 1024 });
+    if (extract.error || extract.status !== 0) return extract.stderr?.trim() || 'archive extraction failed';
+    return '';
+  } catch (error) {
+    return error.message;
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function clearWorkspaceContents(workspace) {
+  const workspacePath = path.resolve(workspace);
+  if (!workspacePath || workspacePath === path.parse(workspacePath).root) {
+    throw new Error('refusing to clear a filesystem root');
+  }
+  fs.mkdirSync(workspacePath, { recursive: true });
+  for (const entry of fs.readdirSync(workspacePath)) {
+    fs.rmSync(path.join(workspacePath, entry), { recursive: true, force: true });
+  }
+  return workspacePath;
+}
+
+async function saveWorkspace(serviceUrl, storageToken, workspace, headSha, secret, repoFullName, prNumber) {
   if (!storageToken) return 'storage is not configured; set STORAGE_SECRET on the backend and storage service';
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tfgit-storage-'));
   const archive = path.join(tempDir, 'workspace.tar.gz');
+  const encryptedArchive = path.join(tempDir, 'workspace.tfgit.enc');
   try {
     const filesList = path.join(tempDir, 'files.list');
     const files = collectWorkspaceFiles(workspace);
@@ -331,15 +437,16 @@ async function saveWorkspace(serviceUrl, storageToken, workspace, headSha) {
       cwd: workspace, encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024,
     });
     if (tar.error || tar.status !== 0) return tar.stderr || tar.error?.message || 'archive creation failed';
-    const archiveSize = fs.statSync(archive).size;
-    console.log(`Terraform workspace archive size: ${formatBytes(archiveSize)}.`);
-    if (archiveSize > MAX_STORAGE_ARCHIVE_BYTES) return 'archive exceeds the 1 GiB limit';
+    await encryptArchive(archive, encryptedArchive, secret, archiveScope(repoFullName, prNumber, headSha));
+    const archiveSize = fs.statSync(encryptedArchive).size;
+    console.log(`Encrypted Terraform workspace archive size: ${formatBytes(archiveSize)}.`);
+    if (archiveSize > MAX_STORAGE_ARCHIVE_BYTES) return 'encrypted archive exceeds the 1 GiB limit';
     console.log('Uploading workspace archive to TFgit storage...');
     const put = spawnSync('curl', [
       '--fail', '--silent', '--show-error', '--location', '-X', 'PUT',
       '-H', `Authorization: Bearer ${storageToken}`, '-H', `X-TFgit-PR-Head-SHA: ${headSha}`,
-      '-H', 'Content-Type: application/gzip',
-      '--upload-file', archive, storageUrl(serviceUrl).toString(),
+      '-H', 'Content-Type: application/vnd.tfgit.encrypted',
+      '--upload-file', encryptedArchive, storageUrl(serviceUrl).toString(),
     ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 });
     if (put.error || put.status !== 0) return put.stderr || put.error?.message || 'storage upload failed';
     console.log('Saved the Terraform workspace; it is available for 30 minutes.');
@@ -348,6 +455,62 @@ async function saveWorkspace(serviceUrl, storageToken, workspace, headSha) {
     return error.message;
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function archiveScope(repository, prNumber, headSha) {
+  return `${repository.toLowerCase()}\n${prNumber}\n${headSha.toLowerCase()}`;
+}
+
+function archiveKey(secret, salt, scope) {
+  return crypto.scryptSync(secret, Buffer.concat([salt, Buffer.from(scope)]), 32);
+}
+
+async function encryptArchive(inputPath, outputPath, secret, scope) {
+  const salt = crypto.randomBytes(16);
+  const iv = crypto.randomBytes(12);
+  const scopeBytes = Buffer.from(scope);
+  const cipher = crypto.createCipheriv('aes-256-gcm', archiveKey(secret, salt, scope), iv);
+  cipher.setAAD(scopeBytes);
+  const ciphertextPath = `${outputPath}.payload`;
+  try {
+    await pipeline(createReadStream(inputPath), cipher, createWriteStream(ciphertextPath, { mode: 0o600 }));
+    const header = Buffer.concat([ENCRYPTED_ARCHIVE_MAGIC, salt, iv, cipher.getAuthTag()]);
+    fs.writeFileSync(outputPath, header, { mode: 0o600 });
+    await pipeline(createReadStream(ciphertextPath), createWriteStream(outputPath, { flags: 'a', mode: 0o600 }));
+  } finally {
+    fs.rmSync(ciphertextPath, { force: true });
+  }
+}
+
+async function decryptArchive(inputPath, outputPath, secret, scope) {
+  const header = Buffer.alloc(ENCRYPTED_ARCHIVE_HEADER_SIZE);
+  const descriptor = fs.openSync(inputPath, 'r');
+  let bytesRead;
+  try {
+    bytesRead = fs.readSync(descriptor, header, 0, header.length, 0);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  if (bytesRead !== header.length || !header.subarray(0, ENCRYPTED_ARCHIVE_MAGIC.length).equals(ENCRYPTED_ARCHIVE_MAGIC)) {
+    throw new Error('saved workspace archive has an invalid encryption header');
+  }
+  const saltStart = ENCRYPTED_ARCHIVE_MAGIC.length;
+  const ivStart = saltStart + 16;
+  const tagStart = ivStart + 12;
+  const salt = header.subarray(saltStart, ivStart);
+  const iv = header.subarray(ivStart, tagStart);
+  const tag = header.subarray(tagStart, ENCRYPTED_ARCHIVE_HEADER_SIZE);
+  const scopeBytes = Buffer.from(scope);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', archiveKey(secret, salt, scope), iv);
+  decipher.setAAD(scopeBytes);
+  decipher.setAuthTag(tag);
+  try {
+    await pipeline(createReadStream(inputPath, { start: ENCRYPTED_ARCHIVE_HEADER_SIZE }), decipher,
+      createWriteStream(outputPath, { mode: 0o600 }));
+  } catch {
+    fs.rmSync(outputPath, { force: true });
+    throw new Error('could not decrypt the saved workspace archive; verify TFgit secret and PR revision');
   }
 }
 
@@ -454,7 +617,8 @@ function readEventPayload() {
   }
 }
 
-function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs = [], commentCommandIndex = -1) {
+function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs = [], commentCommandIndex = -1,
+  commandEnvironment = process.env) {
   const results = [];
   const runStage = (commands, stage) => {
     if (commands.length === 0) {
@@ -467,7 +631,7 @@ function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs
       const result = stage === 'playbook' && index === commentCommandIndex
         ? spawnSync('terraform', commandArgs, {
           cwd: workspace,
-          env: process.env,
+          env: commandEnvironment,
           shell: false,
           encoding: 'utf8',
           maxBuffer: 20 * 1024 * 1024,
@@ -475,7 +639,7 @@ function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs
         })
         : spawnSync(command, {
           cwd: workspace,
-          env: process.env,
+          env: commandEnvironment,
           shell: true,
           encoding: 'utf8',
           maxBuffer: 20 * 1024 * 1024,
