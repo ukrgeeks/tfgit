@@ -458,7 +458,7 @@ async function saveWorkspace(serviceUrl, storageToken, workspace, headSha, secre
       '--upload-file', encryptedArchive, storageUrl(serviceUrl).toString(),
     ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 });
     if (put.error || put.status !== 0) return put.stderr || put.error?.message || 'storage upload failed';
-    console.log('Saved the Terraform workspace; it is available for 30 minutes.');
+    console.log('Saved the Terraform workspace; it is available for 1 hour.');
     return '';
   } catch (error) {
     return error.message;
