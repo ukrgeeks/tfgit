@@ -145,12 +145,12 @@ async function main() {
     GITHUB_REPO_NAME: repo,
     GITHUB_PR_NUMBER: String(pullRequest.number),
     GITHUB_PR_BASE_BRANCH: pullRequest.base.ref,
+    GITHUB_PR_BASE_REPOSITORY: pullRequest.base.repo?.full_name || repoFullName,
     GITHUB_PR_HEAD_BRANCH: pullRequest.head.ref,
     GITHUB_PR_TITLE: pullRequest.title || '',
     GITHUB_PR_URL: pullRequest.html_url || '',
     GITHUB_PR_STATE: pullRequest.state || '',
     GITHUB_PR_AUTHOR: pullRequest.user?.login || '',
-    GITHUB_PR_BASE_REPOSITORY: pullRequest.base.repo?.full_name || '',
     GITHUB_PR_HEAD_REPOSITORY: pullRequest.head.repo?.full_name || '',
     GITHUB_PR_BASE_SHA: pullRequest.base.sha || '',
     GITHUB_PR_HEAD_SHA: pullRequest.head.sha || '',
@@ -208,9 +208,12 @@ async function main() {
     const baseBranch = pullRequestEnvironment.GITHUB_PR_BASE_BRANCH;
     const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
     const backendConfig = validation.terraform_backend
+      .replaceAll('${TFGIT_STATE_BRANCH}', baseBranch.split('/').map(encodeURIComponent).join('/'))
       .replaceAll('${path.module}', hclString(workspace))
       .replaceAll('${GITHUB_REPO_NAME}', hclString(repo))
       .replaceAll('${GITHUB_PR_BASE_BRANCH}', hclString(baseBranch))
+      .replaceAll('${GITHUB_PR_BASE_REPOSITORY}', hclString(pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY))
+      .replaceAll('${TFGIT_SECRET}', hclString(secret))
       .replaceAll('${BASE_REPO_NAME}', hclString(repo))
       .replaceAll('${BASE_BRANCH_NAME}', hclString(baseBranch))
       .replaceAll('${AWS_DEFAULT_REGION}', hclString(process.env.AWS_DEFAULT_REGION || ''));
@@ -327,7 +330,7 @@ async function reportRunState(serviceUrl, report) {
 }
 
 function storageUrl(serviceUrl) {
-  return new URL('/storage', serviceUrl);
+  return new URL('/storage/tfplan', serviceUrl);
 }
 
 async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, headSha, secret, repoFullName) {
@@ -562,7 +565,7 @@ async function clearWorkspaceBeforePlan(serviceUrl, storageToken) {
       method: 'DELETE', headers: { authorization: `Bearer ${storageToken}` },
     });
     if (!response.ok && response.status === 404) {
-      return 'HTTP 404 from the storage endpoint; route /storage directly to the storage service, preserve the path, and ensure the deployed service has DELETE /storage. The storage API returns HTTP 200 when the PR folder is already absent';
+      return 'HTTP 404 from the tfplan storage endpoint; route /storage directly to the storage service, preserve the path, and ensure the deployed service has DELETE /storage/tfplan. The storage API returns HTTP 200 when the PR folder is already absent';
     }
     if (!response.ok) return `storage returned HTTP ${response.status}`;
     return '';

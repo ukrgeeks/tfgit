@@ -72,4 +72,6 @@ The Action transfers the runner workspace through `https://tfgit.ukrgeeks.com/st
 
 The playbook is executable shell input and runs against the PR head. Do not expose AWS/cloud credentials to this job for untrusted PRs. Review command output before sharing it in PR comments; Terraform output may contain sensitive values.
 
-The action also exports `GITHUB_REPO_NAME` (the repository name without its owner) to every playbook command. Backend templates can use `${GITHUB_REPO_NAME}` and `${GITHUB_PR_BASE_BRANCH}` as placeholders; TFgit replaces them with the repository name and PR target branch when generating `backend.tf`.
+The action also exports `GITHUB_REPO_NAME` (the repository name without its owner) to every playbook command. Backend templates can use `${GITHUB_REPO_NAME}`, `${GITHUB_PR_BASE_REPOSITORY}`, `${GITHUB_PR_BASE_BRANCH}`, and `${TFGIT_SECRET}` as placeholders; TFgit replaces them with the repository name, PR target repository, PR target branch, and configured secret when generating `backend.tf`. `${TFGIT_STATE_BRANCH}` is reserved for TFgit's generated state URL and URL-encodes the PR target branch.
+
+The default TFgit backend uses the Terraform HTTP state protocol at `/storage/tfstate/{owner}/{repository}/{base-branch}`. The action fills the repository and base-branch placeholders and the storage service authenticates the HTTP Basic password against the active customer's `TFGIT_SECRET`. State is isolated by customer, repository, and base branch; the Backends → TFstate page lists state metadata without exposing state contents.
