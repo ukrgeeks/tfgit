@@ -30,6 +30,8 @@ async function main() {
     fail('GITHUB_WORKSPACE and GITHUB_REPOSITORY must be available.');
   }
 
+  console.log(`[TFgit] Starting run for ${repoFullName}; GitHub run ${process.env.GITHUB_RUN_ID || 'unknown'}.`);
+  console.log(`[TFgit] Validating subscription, repository access, PR #${pullRequestNumber}, and playbook with ${serviceUrl}.`);
   const endpoint = new URL(validationPath, serviceUrl);
   let validationResponse;
   try {
@@ -61,7 +63,7 @@ async function main() {
       ? `tfgit validation failed (HTTP ${validationResponse.status}): ${reason}`
       : `tfgit validation failed (HTTP ${validationResponse.status}).`);
   }
-  console.log('tfgit secret validated.');
+  console.log('[TFgit] Secret, subscription, and repository access validated.');
 
   const prNumber = validation.pr_number || validation.pull_request_number;
   const requestedCommand = validation.command || '';
@@ -143,7 +145,7 @@ async function main() {
   }
 
   const pullRequest = await getPullRequestDetails(owner, repo, prNumber, apiHeaders);
-  console.log(`Using playbook: ${playbookName}.`);
+  console.log(`[TFgit] Selected playbook: ${playbookName}.`);
   const pullRequestEnvironment = {
     GITHUB_REPO_NAME: repo,
     GITHUB_PR_NUMBER: String(pullRequest.number),
@@ -167,7 +169,7 @@ async function main() {
   for (const [name, value] of Object.entries(pullRequestEnvironment)) {
     process.env[name] = String(value).replaceAll('\0', '');
   }
-  console.log(`Loaded pull request metadata for PR #${pullRequestEnvironment.GITHUB_PR_NUMBER}.`);
+  console.log(`[TFgit] Loaded PR #${pullRequestEnvironment.GITHUB_PR_NUMBER}: ${pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY} base branch ${pullRequestEnvironment.GITHUB_PR_BASE_BRANCH}, head ${pullRequestEnvironment.GITHUB_PR_HEAD_SHA}.`);
 
   const expandedCommentCommand = requestedCommand
     ? `terraform ${expandedCommandArgs.map((argument) => /\s/.test(argument) ? JSON.stringify(argument) : argument).join(' ')}`
@@ -180,6 +182,7 @@ async function main() {
     .some((item) => /^\s*terraform\s+apply(?:\s|$)/i.test(item));
   const useSavedWorkspace = applyIsRequested && !planIsRequested;
   if (useSavedWorkspace) {
+    console.log(`[TFgit] Apply-only run detected. Looking for a saved plan workspace for PR #${prNumber} at the current head SHA.`);
     const restored = await restoreWorkspace(serviceUrl, validation.storage_token, workspace, prNumber,
       pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName);
     if (restored.missing) {
@@ -201,13 +204,15 @@ async function main() {
     }
     if (restored.error) fail(`Could not restore the saved Terraform workspace: ${restored.error}`);
   } else {
-    console.log(`Fetching pull request ${prNumber} head ${pullRequestEnvironment.GITHUB_PR_HEAD_SHA} into the runner workspace.`);
+    console.log(`[TFgit] No apply-only restore required. Fetching PR #${prNumber} source at head ${pullRequestEnvironment.GITHUB_PR_HEAD_SHA}.`);
     const checkoutError = await checkoutPullRequestHead(owner, repo, pullRequestEnvironment.GITHUB_PR_HEAD_SHA,
       apiHeaders, workspace);
     if (checkoutError) fail(`Could not fetch the pull request workspace: ${checkoutError}`);
+    console.log(`[TFgit] PR #${prNumber} source is ready in the runner workspace.`);
   }
 
   if (backendEnabled) {
+    console.log('[TFgit] Generating backend.tf from the selected backend configuration.');
     const baseBranch = pullRequestEnvironment.GITHUB_PR_BASE_BRANCH;
     const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
     const backendConfig = validation.terraform_backend
@@ -236,8 +241,10 @@ async function main() {
     console.log('Terraform backend injection is disabled; leaving backend.tf unchanged.');
   }
   if (planIsRequested && validation.storage_token) {
+    console.log('[TFgit] Removing any previous saved plan workspace before starting a new plan.');
     const clearError = await clearWorkspaceBeforePlan(serviceUrl, validation.storage_token);
     if (clearError) fail(`Could not invalidate the previous saved plan before starting Terraform plan: ${clearError}`);
+    console.log('[TFgit] Previous saved plan workspace cleared.');
   }
   const commandEnvironment = { ...process.env };
   delete commandEnvironment.TFGIT_SECRET;
@@ -245,6 +252,7 @@ async function main() {
   delete commandEnvironment.GITHUB_TOKEN;
   const steps = runPlaybook(prePlaybook, mainPlaybook, postPlaybook, workspace,
     expandedCommandArgs, commentCommandIndex, commandEnvironment);
+  console.log(`[TFgit] Playbook execution finished: ${steps.filter((step) => step.status === 'success').length}/${steps.length} command(s) succeeded.`);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
@@ -254,6 +262,7 @@ async function main() {
   const applySteps = steps.filter((step) => /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
   const successfulApply = applySteps.length > 0 && applySteps.at(-1).status === 'success';
   if (successfulPlan) {
+    console.log('[TFgit] Terraform plan succeeded. Packaging the runner workspace for a later apply.');
     const storageError = await saveWorkspace(serviceUrl, validation.storage_token, workspace,
       pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName, prNumber);
     if (storageError) {
@@ -263,7 +272,11 @@ async function main() {
         'TFgit could not save this plan workspace. Apply will be unavailable until a plan is saved successfully.');
     }
   }
-  if (successfulApply) await deleteWorkspace(serviceUrl, validation.storage_token);
+  if (successfulApply) {
+    console.log('[TFgit] Terraform apply succeeded. Deleting the saved plan workspace.');
+    await deleteWorkspace(serviceUrl, validation.storage_token);
+  }
+  console.log(`[TFgit] Reporting ${storageTransferFailed ? 'failure' : runStatus} status to the TFgit dashboard.`);
   try {
     const reportResponse = await fetch(new URL('/api/v1/github-actions/report', serviceUrl), {
       method: 'POST',
@@ -292,6 +305,7 @@ async function main() {
   const commentSummaries = summarizeTerraformResults(steps);
   const commentBodies = buildOutputComments(playbookOutput, runUrl, expandedCommentCommand || requestedCommand,
     commentSummaries.lines, commentSummaries.errorLabel);
+  console.log(`[TFgit] Posting ${commentBodies.length} output comment(s) to PR #${prNumber}.`);
   for (const [index, body] of commentBodies.entries()) {
     const commentResponse = await fetch(
       `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/issues/${encodeURIComponent(prNumber)}/comments`,
@@ -343,6 +357,7 @@ async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, h
   const encryptedArchive = path.join(tempDir, 'workspace.tfgit.enc');
   const archive = path.join(tempDir, 'workspace.tar.gz');
   try {
+    console.log(`[TFgit] Downloading the saved plan workspace for PR #${prNumber} from TFgit storage.`);
     const result = spawnSync('curl', [
       '--silent', '--show-error', '--location', '--max-filesize', String(MAX_STORAGE_ARCHIVE_BYTES),
       '--output', encryptedArchive, '--write-out', '%{http_code}',
@@ -351,9 +366,14 @@ async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, h
     ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 });
     if (result.error) return { error: result.error.message };
     const status = Number(result.stdout.trim());
-    if (status === 404) return { missing: true };
+    if (status === 404) {
+      console.log(`[TFgit] No saved plan workspace was found for PR #${prNumber}.`);
+      return { missing: true };
+    }
     if (result.status !== 0 || status !== 200) return { error: `storage returned HTTP ${status || result.status}` };
-    if (fs.statSync(encryptedArchive).size > MAX_STORAGE_ARCHIVE_BYTES) return { error: 'encrypted archive exceeds the 1 GiB limit' };
+    const encryptedSize = fs.statSync(encryptedArchive).size;
+    console.log(`[TFgit] Found saved plan workspace (${formatBytes(encryptedSize)} encrypted). Decrypting and checking archive contents.`);
+    if (encryptedSize > MAX_STORAGE_ARCHIVE_BYTES) return { error: 'encrypted archive exceeds the 1 GiB limit' };
     await decryptArchive(encryptedArchive, archive, secret, archiveScope(repoFullName, prNumber, headSha));
     const listing = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8', timeout: 2 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
     if (listing.error || listing.status !== 0) return { error: 'could not inspect the saved workspace archive' };
@@ -366,7 +386,7 @@ async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, h
       encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024,
     });
     if (extract.error || extract.status !== 0) return { error: extract.stderr || 'archive extraction failed' };
-    console.log(`Restored saved files for PR #${prNumber} before the pre-playbook.`);
+    console.log(`[TFgit] Restored saved plan workspace for PR #${prNumber}; files are ready before the pre-playbook.`);
     return { restored: true };
   } catch (error) {
     return { error: error.message };
@@ -448,6 +468,7 @@ async function saveWorkspace(serviceUrl, storageToken, workspace, headSha, secre
     const filesList = path.join(tempDir, 'files.list');
     const files = collectWorkspaceFiles(workspace);
     if (!files.length) return 'the workspace contains no regular files to save';
+    console.log(`[TFgit] Packaging ${files.length} workspace file(s) for saved plan storage.`);
     fs.writeFileSync(filesList, files.map((file) => `./${file}`).join('\0') + '\0');
     const tar = spawnSync('tar', ['-czf', archive, '--null', '-T', filesList], {
       cwd: workspace, encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024,
@@ -465,7 +486,7 @@ async function saveWorkspace(serviceUrl, storageToken, workspace, headSha, secre
       '--upload-file', encryptedArchive, storageUrl(serviceUrl).toString(),
     ], { encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024 });
     if (put.error || put.status !== 0) return put.stderr || put.error?.message || 'storage upload failed';
-    console.log('Saved the Terraform workspace; it is available for 1 hour.');
+    console.log('[TFgit] Saved plan workspace uploaded successfully; it is available for 1 hour.');
     return '';
   } catch (error) {
     return error.message;
@@ -536,6 +557,12 @@ function formatBytes(bytes) {
   return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
+function formatDuration(milliseconds) {
+  const seconds = Math.floor(milliseconds / 1000);
+  const minutes = Math.floor(seconds / 60);
+  return minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+}
+
 function collectWorkspaceFiles(workspace) {
   const root = path.resolve(workspace);
   const files = [];
@@ -554,10 +581,12 @@ function collectWorkspaceFiles(workspace) {
 async function deleteWorkspace(serviceUrl, storageToken) {
   if (!storageToken) return;
   try {
+    console.log('[TFgit] Deleting saved plan workspace from TFgit storage.');
     const response = await fetch(storageUrl(serviceUrl), {
       method: 'DELETE', headers: { authorization: `Bearer ${storageToken}` },
     });
     if (!response.ok) console.error(`::warning::Could not remove saved workspace after apply (HTTP ${response.status}).`);
+    else console.log('[TFgit] Saved plan workspace deleted.');
   } catch (error) {
     console.error(`::warning::Could not remove saved workspace after apply: ${error.message}`);
   }
@@ -644,6 +673,7 @@ function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs
     for (const [index, command] of commands.entries()) {
       const stageLabel = stage === 'playbook' ? 'playbook step' : `${stage} steps`;
       console.log(`Running tfgit ${stageLabel} ${index + 1}/${commands.length}: ${command}`);
+      const startedAt = Date.now();
       const result = stage === 'playbook' && index === commentCommandIndex
         ? spawnSync('terraform', commandArgs, {
           cwd: workspace,
@@ -667,6 +697,7 @@ function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs
         .trim());
       const status = !result.error && result.status === 0 ? 'success' : 'failure';
       results.push({ command, status, output: output || '(no output)' });
+      console.log(`[TFgit] ${stageLabel} ${index + 1}/${commands.length} ${status} after ${formatDuration(Date.now() - startedAt)}.`);
       if (status === 'failure') return false;
     }
     return true;
