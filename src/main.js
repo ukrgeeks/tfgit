@@ -134,6 +134,9 @@ async function main() {
   if (typeof validation.terraform_backend !== 'string' || validation.terraform_backend.length > 20000) {
     fail('tfgit response terraform_backend must be a string of at most 20,000 characters.');
   }
+  if (typeof validation.tfgit_username !== 'string' || !validation.tfgit_username) {
+    fail('tfgit response must include the account username for Terraform state authentication.');
+  }
   const backendEnabled = validation.terraform_backend_enabled === true;
   if (validation.terraform_backend_enabled !== undefined && typeof validation.terraform_backend_enabled !== 'boolean') {
     fail('tfgit response terraform_backend_enabled must be a boolean.');
@@ -213,6 +216,7 @@ async function main() {
       .replaceAll('${GITHUB_REPO_NAME}', hclString(repo))
       .replaceAll('${GITHUB_PR_BASE_BRANCH}', hclString(baseBranch))
       .replaceAll('${GITHUB_PR_BASE_REPOSITORY}', hclString(pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY))
+      .replaceAll('${TFGIT_USERNAME}', hclString(validation.tfgit_username))
       .replaceAll('${TFGIT_SECRET}', hclString(secret))
       .replaceAll('${BASE_REPO_NAME}', hclString(repo))
       .replaceAll('${BASE_BRANCH_NAME}', hclString(baseBranch))
