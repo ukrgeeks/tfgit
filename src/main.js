@@ -7,6 +7,7 @@ const { createReadStream, createWriteStream } = require('node:fs');
 const { pipeline } = require('node:stream/promises');
 
 const MAX_STORAGE_ARCHIVE_BYTES = 1024 * 1024 * 1024;
+const MAX_TERRAFORM_STATE_BYTES = 100 * 1024 * 1024;
 const ENCRYPTED_ARCHIVE_MAGIC = Buffer.from('TFGITENC1');
 const ENCRYPTED_ARCHIVE_HEADER_SIZE = ENCRYPTED_ARCHIVE_MAGIC.length + 16 + 12 + 16;
 
@@ -143,6 +144,15 @@ async function main() {
   if (validation.terraform_backend_enabled !== undefined && typeof validation.terraform_backend_enabled !== 'boolean') {
     fail('tfgit response terraform_backend_enabled must be a boolean.');
   }
+  const stateStorageEnabled = validation.terraform_state_storage_enabled === true;
+  if (validation.terraform_state_storage_enabled !== undefined
+    && typeof validation.terraform_state_storage_enabled !== 'boolean') {
+    fail('tfgit response terraform_state_storage_enabled must be a boolean.');
+  }
+  if (stateStorageEnabled && (typeof validation.tfstate_key !== 'string' || !validation.tfstate_key
+    || typeof validation.tfstate_token !== 'string' || !validation.tfstate_token)) {
+    fail('TFgit state storage is enabled, but no scoped state-storage authorization was returned.');
+  }
 
   const pullRequest = await getPullRequestDetails(owner, repo, prNumber, apiHeaders);
   console.log(`[TFgit] Selected playbook: ${playbookName}.`);
@@ -216,7 +226,7 @@ async function main() {
     const baseBranch = pullRequestEnvironment.GITHUB_PR_BASE_BRANCH;
     const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
     const backendConfig = validation.terraform_backend
-      .replaceAll('${TFGIT_STATE_BRANCH}', baseBranch.split('/').map(encodeURIComponent).join('/'))
+      .replaceAll('${TFGIT_STATE_BRANCH}', hclString(baseBranch))
       .replaceAll('${path.module}', hclString(workspace))
       .replaceAll('${GITHUB_REPO_NAME}', hclString(repo))
       .replaceAll('${GITHUB_PR_BASE_BRANCH}', hclString(baseBranch))
@@ -240,6 +250,18 @@ async function main() {
   } else {
     console.log('Terraform backend injection is disabled; leaving backend.tf unchanged.');
   }
+  let terraformStateFile = '';
+  if (stateStorageEnabled) {
+    const expectedStateKey = `${pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY}/${pullRequestEnvironment.GITHUB_PR_BASE_BRANCH}`;
+    if (validation.tfstate_key !== expectedStateKey) {
+      fail('TFgit returned a state key that does not match this PR repository and base branch.');
+    }
+    const stateFileName = `${pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY}-${pullRequestEnvironment.GITHUB_PR_BASE_BRANCH}.tfstate`;
+    terraformStateFile = safeWorkspaceFile(workspace, stateFileName);
+    const restoreState = await restoreTerraformState(serviceUrl, validation.tfstate_token, validation.tfstate_key,
+      terraformStateFile);
+    if (restoreState.error) fail(`Could not restore Terraform state: ${restoreState.error}`);
+  }
   if (planIsRequested && validation.storage_token) {
     console.log('[TFgit] Removing any previous saved plan workspace before starting a new plan.');
     const clearError = await clearWorkspaceBeforePlan(serviceUrl, validation.storage_token);
@@ -257,11 +279,24 @@ async function main() {
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
   let storageTransferFailed = false;
+  if (stateStorageEnabled && terraformStateFile && fs.existsSync(terraformStateFile)) {
+    console.log(`[TFgit] Uploading the updated Terraform state file for ${validation.tfstate_key}.`);
+    const stateError = await saveTerraformState(serviceUrl, validation.tfstate_token, validation.tfstate_key,
+      terraformStateFile);
+    if (stateError) {
+      storageTransferFailed = true;
+      console.error(`::warning::Could not save Terraform state: ${stateError}`);
+      await postPullRequestComment(owner, repo, prNumber, apiHeaders,
+        'TFgit could not save the Terraform state file. The next run may use stale state until storage is available.');
+    } else {
+      console.log('[TFgit] Terraform state file uploaded successfully.');
+    }
+  }
   const planSteps = steps.filter((step) => /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
   const successfulPlan = planSteps.length > 0 && planSteps.at(-1).status === 'success';
   const applySteps = steps.filter((step) => /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
   const successfulApply = applySteps.length > 0 && applySteps.at(-1).status === 'success';
-  if (successfulPlan) {
+  if (successfulPlan && !storageTransferFailed) {
     console.log('[TFgit] Terraform plan succeeded. Packaging the runner workspace for a later apply.');
     const storageError = await saveWorkspace(serviceUrl, validation.storage_token, workspace,
       pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName, prNumber);
@@ -291,9 +326,9 @@ async function main() {
         plan_ready: successfulApply
           ? false
           : (planIsRequested ? successfulPlan && !storageTransferFailed : null),
-        apply_success: applyIsRequested ? successfulApply : (planIsRequested ? false : null),
+        apply_success: applyIsRequested ? successfulApply && !storageTransferFailed : (planIsRequested ? false : null),
         output: (storageTransferFailed
-          ? `${playbookOutput}\n\nTFgit could not save the workspace; apply is unavailable until a plan is saved successfully.`
+          ? `${playbookOutput}\n\nTFgit could not persist Terraform state or plan data; apply may be unavailable until storage is healthy.`
           : playbookOutput).slice(0, 60000),
         run_url: runUrl,
       }),
@@ -320,7 +355,7 @@ async function main() {
     }
   }
   console.log(`Posted playbook output in ${commentBodies.length} collapsed comment${commentBodies.length === 1 ? '' : 's'} to pull request ${prNumber}.`);
-  if (storageTransferFailed) fail('The Terraform plan succeeded, but TFgit could not save its workspace for apply.');
+  if (storageTransferFailed) fail('Terraform state or plan data could not be saved to TFgit storage.');
   if (steps.some((step) => step.status !== 'success')) {
     fail('One or more tfgit playbook commands failed. See the pull request comment for output.');
   }
@@ -349,6 +384,88 @@ async function reportRunState(serviceUrl, report) {
 
 function storageUrl(serviceUrl) {
   return new URL('/storage/tfplan', serviceUrl);
+}
+
+function tfstateStorageUrl(serviceUrl, stateKey) {
+  const encodedKey = stateKey.split('/').map((part) => encodeURIComponent(part)).join('/');
+  return new URL(`/storage/tfstate/${encodedKey}`, serviceUrl);
+}
+
+function safeWorkspaceFile(workspace, relativeFile) {
+  const root = path.resolve(workspace);
+  const destination = path.resolve(root, relativeFile);
+  const relative = path.relative(root, destination);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    fail('Refusing to use a Terraform state path outside the runner workspace.');
+  }
+  let current = root;
+  for (const part of relative.split(path.sep).slice(0, -1)) {
+    current = path.join(current, part);
+    try {
+      if (fs.lstatSync(current).isSymbolicLink()) fail('Refusing to use a Terraform state path through a symbolic link.');
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+    }
+  }
+  try {
+    if (fs.lstatSync(destination).isSymbolicLink()) fail('Refusing to use a Terraform state file that is a symbolic link.');
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+  return destination;
+}
+
+async function restoreTerraformState(serviceUrl, stateToken, stateKey, stateFile) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tfgit-tfstate-'));
+  const downloadedState = path.join(tempDir, 'terraform.tfstate');
+  try {
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true, mode: 0o700 });
+    console.log(`[TFgit] Checking storage for the state file at ${stateKey}.`);
+    const result = spawnSync('curl', [
+      '--silent', '--show-error', '--location', '--max-filesize', String(MAX_TERRAFORM_STATE_BYTES),
+      '--output', downloadedState, '--write-out', '%{http_code}',
+      '-H', `Authorization: Bearer ${stateToken}`,
+      tfstateStorageUrl(serviceUrl, stateKey).toString(),
+    ], { encoding: 'utf8', timeout: 2 * 60 * 1000, maxBuffer: 1024 * 1024 });
+    if (result.error) return { error: result.error.message };
+    const status = Number(result.stdout.trim());
+    if (status === 404) {
+      console.log(`[TFgit] No saved state file exists for ${stateKey}; Terraform will initialize state in the runner.`);
+      return { missing: true };
+    }
+    if (result.status !== 0 || status !== 200) return { error: `storage returned HTTP ${status || result.status}` };
+    const size = fs.statSync(downloadedState).size;
+    if (size > MAX_TERRAFORM_STATE_BYTES) return { error: 'state file exceeds the 100 MiB limit' };
+    console.log(`[TFgit] Found the saved state file (${formatBytes(size)}). Restoring it to the runner workspace.`);
+    fs.mkdirSync(path.dirname(stateFile), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(downloadedState, stateFile);
+    fs.chmodSync(stateFile, 0o600);
+    console.log(`[TFgit] Restored state file to ${path.relative(process.env.GITHUB_WORKSPACE, stateFile)}.`);
+    return { restored: true };
+  } catch (error) {
+    return { error: error.message };
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function saveTerraformState(serviceUrl, stateToken, stateKey, stateFile) {
+  try {
+    const size = fs.statSync(stateFile).size;
+    if (size > MAX_TERRAFORM_STATE_BYTES) return 'Terraform state file exceeds the 100 MiB limit';
+    console.log(`[TFgit] Uploading Terraform state (${formatBytes(size)}) for ${stateKey}.`);
+    const result = spawnSync('curl', [
+      '--fail', '--silent', '--show-error', '--location', '-X', 'PUT',
+      '-H', `Authorization: Bearer ${stateToken}`,
+      '-H', 'Content-Type: application/json',
+      '--upload-file', stateFile,
+      tfstateStorageUrl(serviceUrl, stateKey).toString(),
+    ], { encoding: 'utf8', timeout: 2 * 60 * 1000, maxBuffer: 1024 * 1024 });
+    if (result.error || result.status !== 0) return result.stderr || result.error?.message || 'state upload failed';
+    return '';
+  } catch (error) {
+    return error.message;
+  }
 }
 
 async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, headSha, secret, repoFullName) {
@@ -520,7 +637,7 @@ async function encryptArchive(inputPath, outputPath, secret, scope) {
   }
 }
 
-async function decryptArchive(inputPath, outputPath, secret, scope) {
+async function decryptArchive(inputPath, outputPath, secret, scope, artifactName = 'saved workspace archive') {
   const header = Buffer.alloc(ENCRYPTED_ARCHIVE_HEADER_SIZE);
   const descriptor = fs.openSync(inputPath, 'r');
   let bytesRead;
@@ -530,7 +647,7 @@ async function decryptArchive(inputPath, outputPath, secret, scope) {
     fs.closeSync(descriptor);
   }
   if (bytesRead !== header.length || !header.subarray(0, ENCRYPTED_ARCHIVE_MAGIC.length).equals(ENCRYPTED_ARCHIVE_MAGIC)) {
-    throw new Error('saved workspace archive has an invalid encryption header');
+    throw new Error(`${artifactName} has an invalid encryption header`);
   }
   const saltStart = ENCRYPTED_ARCHIVE_MAGIC.length;
   const ivStart = saltStart + 16;
@@ -547,7 +664,7 @@ async function decryptArchive(inputPath, outputPath, secret, scope) {
       createWriteStream(outputPath, { mode: 0o600 }));
   } catch {
     fs.rmSync(outputPath, { force: true });
-    throw new Error('could not decrypt the saved workspace archive; verify TFgit secret and PR revision');
+    throw new Error(`could not decrypt the ${artifactName}; verify the TFgit secret and storage scope`);
   }
 }
 
