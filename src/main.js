@@ -1,7 +1,7 @@
 const fs = require('node:fs');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 const path = require('node:path');
 const { createReadStream, createWriteStream } = require('node:fs');
 const { pipeline } = require('node:stream/promises');
@@ -272,8 +272,8 @@ async function main() {
   delete commandEnvironment.TFGIT_SECRET;
   delete commandEnvironment.INPUT_TFGIT_SECRET;
   delete commandEnvironment.GITHUB_TOKEN;
-  const steps = runPlaybook(prePlaybook, mainPlaybook, postPlaybook, workspace,
-    expandedCommandArgs, commentCommandIndex, commandEnvironment);
+  const steps = await runPlaybook(prePlaybook, mainPlaybook, postPlaybook, workspace,
+    expandedCommandArgs, commentCommandIndex, commandEnvironment, secret);
   console.log(`[TFgit] Playbook execution finished: ${steps.filter((step) => step.status === 'success').length}/${steps.length} command(s) succeeded.`);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
@@ -779,53 +779,154 @@ function readEventPayload() {
   }
 }
 
-function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs = [], commentCommandIndex = -1,
-  commandEnvironment = process.env) {
+async function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, commandArgs = [], commentCommandIndex = -1,
+  commandEnvironment = process.env, secret = '') {
   const results = [];
-  const runStage = (commands, stage) => {
+  const runStage = async (commands, stage) => {
     if (commands.length === 0) {
       console.log(`Running tfgit ${stage} step 1/1: list is empty`);
       return true;
     }
     for (const [index, command] of commands.entries()) {
       const stageLabel = stage === 'playbook' ? 'playbook step' : `${stage} steps`;
-      console.log(`Running tfgit ${stageLabel} ${index + 1}/${commands.length}: ${command}`);
       const startedAt = Date.now();
-      const result = stage === 'playbook' && index === commentCommandIndex
-        ? spawnSync('terraform', commandArgs, {
+      const isCommentTerraformCommand = stage === 'playbook' && index === commentCommandIndex;
+      let effectiveCommand = command;
+      let args;
+      if (isCommentTerraformCommand) {
+        args = [...commandArgs];
+        if (['plan', 'apply'].includes(args[0]?.toLowerCase())) ensureNonInteractiveTerraformArguments(args);
+        effectiveCommand = `terraform ${args.map((argument) => /\s/.test(argument) ? JSON.stringify(argument) : argument).join(' ')}`;
+      } else if (/^\s*terraform\s+(?:plan|apply)(?=\s|$)/i.test(command)) {
+        effectiveCommand = ensureNonInteractiveTerraformCommand(command);
+      }
+      console.log(`Running tfgit ${stageLabel} ${index + 1}/${commands.length}: ${effectiveCommand}`);
+      console.log(`[TFgit] Streaming ${stageLabel} output to the GitHub Actions log.`);
+      const result = await runCommand(isCommentTerraformCommand ? 'terraform' : effectiveCommand,
+        isCommentTerraformCommand ? args : [], {
           cwd: workspace,
           env: commandEnvironment,
-          shell: false,
-          encoding: 'utf8',
-          maxBuffer: 20 * 1024 * 1024,
+          shell: !isCommentTerraformCommand,
           timeout: 30 * 60 * 1000,
-        })
-        : spawnSync(command, {
-          cwd: workspace,
-          env: commandEnvironment,
-          shell: true,
-          encoding: 'utf8',
-          maxBuffer: 20 * 1024 * 1024,
-          timeout: 30 * 60 * 1000,
-        });
-      const output = stripTerminalSequences([result.stdout, result.stderr, result.error?.message]
-        .filter(Boolean)
-        .join('\n')
-        .trim());
-      const status = !result.error && result.status === 0 ? 'success' : 'failure';
-      results.push({ command, status, output: output || '(no output)' });
+        }, secret);
+      const output = stripTerminalSequences(result.output).replaceAll(secret, '[REDACTED]').trim();
+      const status = result.status === 0 ? 'success' : 'failure';
+      results.push({ command: effectiveCommand, status, output: output || '(no output)' });
       console.log(`[TFgit] ${stageLabel} ${index + 1}/${commands.length} ${status} after ${formatDuration(Date.now() - startedAt)}.`);
       if (status === 'failure') return false;
     }
     return true;
   };
 
-  if (runStage(prePlaybook, 'pre-playbook')) {
-    if (runStage(playbook, 'playbook')) {
-      runStage(postPlaybook, 'post-playbook');
+  if (await runStage(prePlaybook, 'pre-playbook')) {
+    if (await runStage(playbook, 'playbook')) {
+      await runStage(postPlaybook, 'post-playbook');
     }
   }
   return results;
+}
+
+function ensureNonInteractiveTerraformArguments(args) {
+  const options = [['-input', 'false']];
+  if (args[0]?.toLowerCase() === 'apply') options.unshift(['-auto-approve', 'true']);
+  for (const [name, value] of options) {
+    const index = args.findIndex((argument) => argument === name || argument.startsWith(`${name}=`));
+    const desired = value === 'true' ? name : `${name}=${value}`;
+    if (index < 0) args.splice(1, 0, desired);
+    else if (args[index] !== desired) args[index] = desired;
+  }
+}
+
+function ensureNonInteractiveTerraformCommand(command) {
+  const subcommand = /^\s*terraform\s+(plan|apply)(?=\s|$)/i.exec(command)?.[1].toLowerCase();
+  if (!subcommand) return command;
+  const options = [['-input', 'false']];
+  if (subcommand === 'apply') options.unshift(['-auto-approve', 'true']);
+  let updated = command;
+  const prefix = new RegExp(`^(\\s*terraform\\s+${subcommand})(?=\\s|$)`, 'i');
+  for (const [name, value] of options) {
+    const optionPattern = new RegExp(`(^|\\s)${name}(?:=(?:true|false))?(?=\\s|$)`, 'i');
+    if (optionPattern.test(updated)) {
+      updated = updated.replace(optionPattern, `$1${value === 'true' ? name : `${name}=${value}`}`);
+    } else {
+      updated = updated.replace(prefix, `$1 ${value === 'true' ? name : `${name}=${value}`}`);
+    }
+  }
+  return updated;
+}
+
+function runCommand(command, args, options, secret) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, { ...options, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      resolve({ status: 1, output: error.message });
+      return;
+    }
+    const maxCapturedBytes = 20 * 1024 * 1024;
+    const captured = [];
+    let capturedBytes = 0;
+    let outputTruncated = false;
+    let spawnError = '';
+    const logStreams = [
+      { stream: child.stdout, destination: process.stdout, pending: '' },
+      { stream: child.stderr, destination: process.stderr, pending: '' },
+    ];
+    const stopCommandToken = `TFGIT_${crypto.randomBytes(16).toString('hex')}`;
+    process.stdout.write(`::stop-commands::${stopCommandToken}\n`);
+    const emitLog = (state, chunk, flush = false) => {
+      state.pending += chunk.toString('utf8');
+      let safeLength = flush ? state.pending.length
+        : Math.max(0, state.pending.length - (secret ? secret.length - 1 : 0));
+      if (!flush && secret) {
+        for (let match = state.pending.indexOf(secret); match >= 0 && match < safeLength;
+          match = state.pending.indexOf(secret, match + 1)) {
+          if (match + secret.length > safeLength) safeLength = match;
+        }
+        const maxPartial = Math.min(secret.length - 1, state.pending.length);
+        for (let length = maxPartial; length > 0; length -= 1) {
+          if (state.pending.endsWith(secret.slice(0, length))) {
+            safeLength = Math.min(safeLength, state.pending.length - length);
+            break;
+          }
+        }
+      }
+      if (!safeLength) return;
+      const safe = state.pending.slice(0, safeLength);
+      state.pending = state.pending.slice(safeLength);
+      const redacted = secret ? safe.replaceAll(secret, '[REDACTED]') : safe;
+      state.destination.write(stripTerminalSequences(redacted));
+    };
+    for (const state of logStreams) {
+      state.stream.on('data', (chunk) => {
+        if (capturedBytes < maxCapturedBytes) {
+          const remaining = maxCapturedBytes - capturedBytes;
+          const kept = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+          captured.push(kept);
+          capturedBytes += kept.length;
+          if (kept.length < chunk.length) outputTruncated = true;
+        } else outputTruncated = true;
+        emitLog(state, chunk);
+      });
+      state.stream.on('end', () => emitLog(state, Buffer.alloc(0), true));
+    }
+    child.on('error', (error) => { spawnError = error.message; });
+    const timeout = setTimeout(() => {
+      spawnError = `command timed out after ${Math.round(options.timeout / 60000)} minutes`;
+      child.kill('SIGTERM');
+      setTimeout(() => { if (child.exitCode === null) child.kill('SIGKILL'); }, 5000).unref();
+    }, options.timeout);
+    timeout.unref();
+    child.on('close', (code) => {
+      clearTimeout(timeout);
+      process.stdout.write(`\n::${stopCommandToken}::\n`);
+      let output = Buffer.concat(captured).toString('utf8');
+      if (outputTruncated) output += '\n[TFgit truncated captured output after 20 MiB; full output is in the GitHub Actions log.]';
+      if (spawnError) output += `${output ? '\n' : ''}${spawnError}`;
+      resolve({ status: spawnError ? 1 : (code ?? 1), output });
+    });
+  });
 }
 
 function formatPlaybookOutput(steps) {
