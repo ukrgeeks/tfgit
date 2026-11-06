@@ -67,16 +67,20 @@ async function main() {
   }
   console.log('[TFgit] Secret, subscription, and repository access validated.');
   const mode = validation.tfgit_mode || 'terraform';
-  if (!['terraform', 'tofu'].includes(mode)) {
-    fail(`tfgit returned unsupported mode "${mode}". Expected "terraform" or "tofu".`);
+  if (!['terraform', 'tofu', 'custom'].includes(mode)) {
+    fail(`tfgit returned unsupported mode "${mode}". Expected "terraform", "tofu", or "custom".`);
   }
-  const versionVariable = mode === 'tofu' ? 'TOFU_VERSION' : 'TERRAFORM_VERSION';
-  const requestedTerraformVersion = (process.env[versionVariable] || 'latest').trim();
-  if (!requestedTerraformVersion) fail(`${versionVariable} must be "latest" or an exact version.`);
-  const cliName = mode === 'tofu' ? 'OpenTofu' : 'Terraform';
-  console.log(`[TFgit] Mode: ${mode}. Installing ${cliName} ${requestedTerraformVersion}.`);
-  const terraformInstallError = await installTerraform(requestedTerraformVersion, mode);
-  if (terraformInstallError) fail(`Could not install ${cliName}: ${terraformInstallError}`);
+  if (mode === 'custom') {
+    console.log('[TFgit] Mode: custom. Skipping Terraform/OpenTofu installation; playbook setup commands control the tools.');
+  } else {
+    const versionVariable = mode === 'tofu' ? 'TOFU_VERSION' : 'TERRAFORM_VERSION';
+    const requestedTerraformVersion = (process.env[versionVariable] || 'latest').trim();
+    if (!requestedTerraformVersion) fail(`${versionVariable} must be "latest" or an exact version.`);
+    const cliName = mode === 'tofu' ? 'OpenTofu' : 'Terraform';
+    console.log(`[TFgit] Mode: ${mode}. Installing ${cliName} ${requestedTerraformVersion}.`);
+    const terraformInstallError = await installTerraform(requestedTerraformVersion, mode);
+    if (terraformInstallError) fail(`Could not install ${cliName}: ${terraformInstallError}`);
+  }
 
   const prNumber = validation.pr_number || validation.pull_request_number;
   const requestedCommand = validation.command || '';
@@ -130,7 +134,7 @@ async function main() {
 
   const playbook = validation.playbook;
   const playbookName = validation.playbook_name || 'Default';
-  const prePlaybook = validation.pre_playbook ?? ['terraform init'];
+  const prePlaybook = validation.pre_playbook ?? (mode === 'custom' ? [] : ['terraform init']);
   const postPlaybook = validation.post_playbook ?? [];
   if (!Array.isArray(prePlaybook) || !prePlaybook.every((item) => typeof item === 'string' && item.trim())
     || !Array.isArray(postPlaybook) || !postPlaybook.every((item) => typeof item === 'string' && item.trim())) {
@@ -140,8 +144,8 @@ async function main() {
     || !commandArgs.every((arg) => typeof arg === 'string'))) {
     fail('tfgit response must include valid parsed Terraform command arguments.');
   }
-  if (!Array.isArray(playbook) || playbook.length === 0 || !playbook.every((command) => typeof command === 'string' && command.trim())) {
-    fail('tfgit response playbook must be a non-empty array of command strings.');
+  if (!Array.isArray(playbook) || (playbook.length === 0 && mode !== 'custom') || !playbook.every((command) => typeof command === 'string' && command.trim())) {
+    fail(`tfgit response playbook must be ${mode === 'custom' ? 'an array' : 'a non-empty array'} of command strings.`);
   }
   if (typeof playbookName !== 'string' || !/^[A-Za-z0-9]{1,32}$/.test(playbookName)) {
     fail('tfgit response playbook_name must contain 1–32 letters or digits.');
@@ -305,9 +309,9 @@ async function main() {
       console.log('[TFgit] Terraform state file uploaded successfully.');
     }
   }
-  const planSteps = steps.filter((step) => /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
+  const planSteps = steps.filter((step) => /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
   const successfulPlan = planSteps.length > 0 && planSteps.at(-1).status === 'success';
-  const applySteps = steps.filter((step) => /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
+  const applySteps = steps.filter((step) => /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
   const successfulApply = applySteps.length > 0 && applySteps.at(-1).status === 'success';
   if (successfulPlan && !storageTransferFailed) {
     console.log('[TFgit] Terraform plan succeeded. Packaging the runner workspace for a later apply.');
@@ -810,7 +814,7 @@ async function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, comma
         args = [...commandArgs];
         if (['plan', 'apply'].includes(args[0]?.toLowerCase())) ensureNonInteractiveTerraformArguments(args);
         effectiveCommand = `terraform ${args.map((argument) => /\s/.test(argument) ? JSON.stringify(argument) : argument).join(' ')}`;
-      } else if (/^\s*terraform\s+(?:plan|apply)(?=\s|$)/i.test(command)) {
+      } else if (/^\s*(?:terraform|tofu)\s+(?:plan|apply)(?=\s|$)/i.test(command)) {
         effectiveCommand = ensureNonInteractiveTerraformCommand(command);
       }
       console.log(`Running tfgit ${stageLabel} ${index + 1}/${commands.length}: ${effectiveCommand}`);
@@ -954,12 +958,13 @@ function ensureNonInteractiveTerraformArguments(args) {
 }
 
 function ensureNonInteractiveTerraformCommand(command) {
-  const subcommand = /^\s*terraform\s+(plan|apply)(?=\s|$)/i.exec(command)?.[1].toLowerCase();
+  const match = /^(\s*)(terraform|tofu)\s+(plan|apply)(?=\s|$)/i.exec(command);
+  const subcommand = match?.[3].toLowerCase();
   if (!subcommand) return command;
   const options = [['-input', 'false']];
   if (subcommand === 'apply') options.unshift(['-auto-approve', 'true']);
   let updated = command;
-  const prefix = new RegExp(`^(\\s*terraform\\s+${subcommand})(?=\\s|$)`, 'i');
+  const prefix = new RegExp(`^(\\s*${match[2]}\\s+${subcommand})(?=\\s|$)`, 'i');
   for (const [name, value] of options) {
     const optionPattern = new RegExp(`(^|\\s)${name}(?:=(?:true|false))?(?=\\s|$)`, 'i');
     if (optionPattern.test(updated)) {
@@ -1096,12 +1101,12 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
 
 function summarizeTerraformResults(steps) {
   const summaries = [];
-  const failedPlan = steps.find((step) => step.status !== 'success' && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
-  const failedApply = steps.find((step) => step.status !== 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
+  const failedPlan = steps.find((step) => step.status !== 'success' && /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
+  const failedApply = steps.find((step) => step.status !== 'success' && /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
   const errorLabel = failedPlan ? 'Plan Error' : failedApply ? 'Apply Error' : '';
   const planSummaryPattern = /Plan:\s*(\d+)\s+to add,\s*(\d+)\s+to change,\s*(\d+)\s+to destroy\./i;
   const successfulPlan = steps.find((step) => step.status === 'success'
-    && /^\s*terraform\s+plan(?:\s|$)/i.test(step.command));
+    && /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
   if (successfulPlan) {
     const counts = successfulPlan.output.match(planSummaryPattern);
     const noChanges = /No changes\. Your infrastructure matches the configuration\./i.test(successfulPlan.output);
@@ -1121,11 +1126,12 @@ function summarizeTerraformResults(steps) {
     } else if (planLine) {
       summaries.push(planLine);
       summaries.push('- ▶️ To apply this plan, comment:');
-      summaries.push('```text\nterraform apply\n```');
+      const cli = /^\s*(tofu)\s+plan(?:\s|$)/i.test(successfulPlan.command) ? 'tofu' : 'terraform';
+      summaries.push(`\`\`\`text\n${cli} apply\n\`\`\``);
     }
   }
 
-  const successfulApply = steps.find((step) => step.status === 'success' && /^\s*terraform\s+apply(?:\s|$)/i.test(step.command));
+  const successfulApply = steps.find((step) => step.status === 'success' && /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
   if (successfulApply) {
     const applySummary = successfulApply.output.match(/^Apply complete! Resources:[^\r\n]*$/m)?.[0];
     if (applySummary) summaries.push(applySummary);
