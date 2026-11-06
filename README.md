@@ -25,16 +25,15 @@ jobs:
   terraform:
     runs-on: ubuntu-latest
     steps:
-      - uses: hashicorp/setup-terraform@v4
-        with:
-          terraform_version: "1.10.5"
-
       - name: Run tfgit playbook
         uses: ukrgeeks/tfgit@main
         env:
           GITHUB_TOKEN: ${{ github.token }}
           TFGIT_URL: https://tfgit.ukrgeeks.com
           TFGIT_SECRET: ${{ secrets.TFGIT_SECRET }}
+          # Optional: set one of these to pin the CLI version selected in TFgit Home.
+          # TERRAFORM_VERSION: "1.10.5"
+          # TOFU_VERSION: "1.10.0"
           # AWS credentials (uncomment and add these secrets to the repository):
           # AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           # AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -46,7 +45,7 @@ jobs:
           # ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
 ```
 
-Set `TFGIT_SECRET` from the repository Actions secret and `TFGIT_URL` to your TFgit service URL in the step environment. These can also be provided as action inputs (`tfgit_secret` and `service_url`) for compatibility. tfgit supplies the playbook and PR number. Before running commands, the action reads the PR through GitHub’s API and exports `GITHUB_PR_NUMBER`, `GITHUB_PR_BASE_BRANCH`, `GITHUB_PR_HEAD_BRANCH`, `GITHUB_PR_TITLE`, `GITHUB_PR_URL`, `GITHUB_PR_STATE`, `GITHUB_PR_AUTHOR`, `GITHUB_PR_BASE_REPOSITORY`, `GITHUB_PR_HEAD_REPOSITORY`, `GITHUB_PR_BASE_SHA`, `GITHUB_PR_HEAD_SHA`, and `GITHUB_PR_IS_DRAFT` to each playbook command. Use them like shell environment variables, for example `echo "$GITHUB_PR_BASE_BRANCH"`. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
+Set the default engine on **Playbooks → Default** and optionally override it on any repository playbook. Repository playbooks inherit the Default engine unless explicitly set. The validation response tells the Action which CLI to install. TFgit downloads the latest release by default and verifies the archive's SHA-256 checksum. To pin an exact version, set `TERRAFORM_VERSION` for Terraform or `TOFU_VERSION` for OpenTofu in the repository workflow environment. A separate CLI setup step is not needed. In OpenTofu mode, TFgit provides both `tofu` and `terraform` executable names, so existing playbook commands such as `terraform plan` continue to run using OpenTofu. Set `TFGIT_SECRET` from the repository Actions secret and `TFGIT_URL` to your TFgit service URL in the step environment. These can also be provided as action inputs (`tfgit_secret` and `service_url`) for compatibility. tfgit supplies the playbook and PR number. Before running commands, the action reads the PR through GitHub’s API and exports `GITHUB_PR_NUMBER`, `GITHUB_PR_BASE_BRANCH`, `GITHUB_PR_HEAD_BRANCH`, `GITHUB_PR_TITLE`, `GITHUB_PR_URL`, `GITHUB_PR_STATE`, `GITHUB_PR_AUTHOR`, `GITHUB_PR_BASE_REPOSITORY`, `GITHUB_PR_HEAD_REPOSITORY`, `GITHUB_PR_BASE_SHA`, `GITHUB_PR_HEAD_SHA`, and `GITHUB_PR_IS_DRAFT` to each playbook command. Use them like shell environment variables, for example `echo "$GITHUB_PR_BASE_BRANCH"`. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
 
 Save the secret shown on the signed-in tfgit homepage as the repository Actions secret `TFGIT_SECRET`. The service validates it against the active subscription and returns that user's playbook. The action reads the PR number from the `workflow_dispatch` input or `repository_dispatch` `client_payload.pull_request_number`. For a comment dispatch, the service passes the one-line Terraform command in the optional `tfgit_playbook` input and parsed arguments separately. Any Terraform subcommand and its options are accepted. The action executes the arguments without a shell and posts its output as a PR comment. The workflow must declare both inputs as shown above.
 
@@ -55,6 +54,7 @@ By default, the action posts the tfgit secret and GitHub run context to `https:/
 ```json
 {
   "valid": true,
+  "tfgit_mode": "terraform",
   "playbook": [
     "terraform init",
     "terraform plan -var-file=env/dev.tfvars"

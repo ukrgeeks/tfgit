@@ -8,6 +8,7 @@ const { pipeline } = require('node:stream/promises');
 
 const MAX_STORAGE_ARCHIVE_BYTES = 1024 * 1024 * 1024;
 const MAX_TERRAFORM_STATE_BYTES = 100 * 1024 * 1024;
+const MAX_TERRAFORM_ARCHIVE_BYTES = 100 * 1024 * 1024;
 const ENCRYPTED_ARCHIVE_MAGIC = Buffer.from('TFGITENC1');
 const ENCRYPTED_ARCHIVE_HEADER_SIZE = ENCRYPTED_ARCHIVE_MAGIC.length + 16 + 12 + 16;
 
@@ -65,6 +66,17 @@ async function main() {
       : `tfgit validation failed (HTTP ${validationResponse.status}).`);
   }
   console.log('[TFgit] Secret, subscription, and repository access validated.');
+  const mode = validation.tfgit_mode || 'terraform';
+  if (!['terraform', 'tofu'].includes(mode)) {
+    fail(`tfgit returned unsupported mode "${mode}". Expected "terraform" or "tofu".`);
+  }
+  const versionVariable = mode === 'tofu' ? 'TOFU_VERSION' : 'TERRAFORM_VERSION';
+  const requestedTerraformVersion = (process.env[versionVariable] || 'latest').trim();
+  if (!requestedTerraformVersion) fail(`${versionVariable} must be "latest" or an exact version.`);
+  const cliName = mode === 'tofu' ? 'OpenTofu' : 'Terraform';
+  console.log(`[TFgit] Mode: ${mode}. Installing ${cliName} ${requestedTerraformVersion}.`);
+  const terraformInstallError = await installTerraform(requestedTerraformVersion, mode);
+  if (terraformInstallError) fail(`Could not install ${cliName}: ${terraformInstallError}`);
 
   const prNumber = validation.pr_number || validation.pull_request_number;
   const requestedCommand = validation.command || '';
@@ -269,6 +281,7 @@ async function main() {
     console.log('[TFgit] Previous saved plan workspace cleared.');
   }
   const commandEnvironment = { ...process.env };
+  commandEnvironment.TFGIT_MODE = mode;
   delete commandEnvironment.TFGIT_SECRET;
   delete commandEnvironment.INPUT_TFGIT_SECRET;
   delete commandEnvironment.GITHUB_TOKEN;
@@ -824,6 +837,109 @@ async function runPlaybook(prePlaybook, playbook, postPlaybook, workspace, comma
     }
   }
   return results;
+}
+
+async function installTerraform(requestedVersion, mode = 'terraform') {
+  const platformNames = { linux: 'linux', darwin: 'darwin', win32: 'windows' };
+  const architectureNames = { x64: 'amd64', arm64: 'arm64', ia32: '386' };
+  const platform = platformNames[process.platform];
+  const architecture = architectureNames[process.arch];
+  if (!platform || !architecture) return `unsupported runner platform ${process.platform}/${process.arch}`;
+
+  const isTofu = mode === 'tofu';
+  let version = requestedVersion;
+  if (version.toLowerCase() === 'latest') {
+    try {
+      const metadataUrl = isTofu
+        ? 'https://api.github.com/repos/opentofu/opentofu/releases/latest'
+        : 'https://checkpoint-api.hashicorp.com/v1/check/terraform';
+      const response = await fetch(metadataUrl, {
+        headers: { accept: 'application/json', 'user-agent': 'tfgit-github-action' },
+        signal: AbortSignal.timeout(30000),
+      });
+      if (!response.ok) return `${isTofu ? 'OpenTofu' : 'HashiCorp'} version lookup returned HTTP ${response.status}`;
+      const metadata = await response.json();
+      version = isTofu ? metadata.tag_name?.replace(/^v/, '') : metadata.current_version;
+    } catch (error) {
+      return `${isTofu ? 'OpenTofu' : 'HashiCorp'} version lookup failed: ${error.message}`;
+    }
+  }
+  if (typeof version !== 'string' || !/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    return `invalid ${isTofu ? 'OpenTofu' : 'Terraform'} version "${version}"`;
+  }
+
+  if (isTofu && architecture === '386') return 'OpenTofu does not provide 32-bit runner binaries';
+  const archiveName = `${isTofu ? 'tofu' : 'terraform'}_${version}_${platform}_${architecture}.zip`;
+  const releaseBase = isTofu
+    ? `https://github.com/opentofu/opentofu/releases/download/v${encodeURIComponent(version)}`
+    : `https://releases.hashicorp.com/terraform/${encodeURIComponent(version)}`;
+  const checksumName = isTofu ? `tofu_${version}_SHA256SUMS` : 'SHA256SUMS';
+  const installDirectory = path.join(os.tmpdir(), `tfgit-${isTofu ? 'tofu' : 'terraform'}-${version}-${platform}-${architecture}`);
+  const archivePath = path.join(os.tmpdir(), archiveName);
+  const executableName = process.platform === 'win32' ? `${isTofu ? 'tofu' : 'terraform'}.exe` : (isTofu ? 'tofu' : 'terraform');
+  const executablePath = path.join(installDirectory, executableName);
+  const terraformAlias = path.join(installDirectory, process.platform === 'win32' ? 'terraform.exe' : 'terraform');
+
+  try {
+    if (!fs.existsSync(executablePath)) {
+      console.log(`[TFgit] Downloading ${isTofu ? 'OpenTofu' : 'Terraform'} ${version} for ${platform}/${architecture}.`);
+      const [archiveResponse, checksumsResponse] = await Promise.all([
+        fetch(`${releaseBase}/${archiveName}`, { signal: AbortSignal.timeout(120000) }),
+        fetch(`${releaseBase}/${checksumName}`, {
+          headers: isTofu ? { accept: 'application/octet-stream' } : undefined,
+          signal: AbortSignal.timeout(30000),
+        }),
+      ]);
+      if (!archiveResponse.ok) return `${isTofu ? 'OpenTofu' : 'Terraform'} archive download returned HTTP ${archiveResponse.status}`;
+      if (!checksumsResponse.ok) return `${isTofu ? 'OpenTofu' : 'Terraform'} checksum download returned HTTP ${checksumsResponse.status}`;
+      const checksumText = await checksumsResponse.text();
+      const expectedHash = checksumText.split(/\r?\n/)
+        .map((line) => line.trim().match(/^([a-fA-F0-9]{64})\s+\*?(\S+)$/))
+        .find((match) => match && match[2] === archiveName)?.[1]?.toLowerCase();
+      if (!expectedHash) return `checksum list does not contain ${archiveName}`;
+
+      const chunks = [];
+      let archiveBytes = 0;
+      for await (const chunk of archiveResponse.body) {
+        archiveBytes += chunk.length;
+        if (archiveBytes > MAX_TERRAFORM_ARCHIVE_BYTES) return `${isTofu ? 'OpenTofu' : 'Terraform'} archive exceeds the 100 MB safety limit`;
+        chunks.push(Buffer.from(chunk));
+      }
+      const archive = Buffer.concat(chunks);
+      const actualHash = crypto.createHash('sha256').update(archive).digest('hex');
+      if (actualHash !== expectedHash) return 'Terraform archive SHA-256 checksum verification failed';
+      fs.mkdirSync(installDirectory, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(archivePath, archive, { mode: 0o600 });
+      const extraction = process.platform === 'win32'
+        ? spawnSync('powershell', ['-NoProfile', '-Command', 'Expand-Archive -LiteralPath $args[0] -DestinationPath $args[1] -Force', archivePath, installDirectory], { encoding: 'utf8' })
+        : spawnSync('unzip', ['-o', archivePath, '-d', installDirectory], { encoding: 'utf8' });
+      if (extraction.error || extraction.status !== 0) {
+        return `could not extract the verified Terraform archive${extraction.error ? `: ${extraction.error.message}` : `: ${extraction.stderr.trim()}`}`;
+      }
+      if (process.platform !== 'win32') fs.chmodSync(executablePath, 0o700);
+    }
+
+    if (isTofu && !fs.existsSync(terraformAlias)) {
+      if (process.platform === 'win32') fs.copyFileSync(executablePath, terraformAlias);
+      else fs.symlinkSync(path.basename(executablePath), terraformAlias);
+    }
+
+    const githubPath = process.env.GITHUB_PATH;
+    if (githubPath) fs.appendFileSync(githubPath, `${installDirectory}${os.EOL}`, { mode: 0o600 });
+    process.env.PATH = `${installDirectory}${path.delimiter}${process.env.PATH || ''}`;
+    const versionCheck = spawnSync(executablePath, ['version'], { encoding: 'utf8', timeout: 15000 });
+    if (versionCheck.error || versionCheck.status !== 0) {
+      return `installed ${isTofu ? 'OpenTofu' : 'Terraform'} could not be started${versionCheck.error ? `: ${versionCheck.error.message}` : ''}`;
+    }
+    const installedVersion = /(?:Terraform|OpenTofu) v([^\s]+)/.exec(versionCheck.stdout)?.[1];
+    if (installedVersion !== version) return `requested ${isTofu ? 'OpenTofu' : 'Terraform'} ${version}, but ${installedVersion || 'an unknown version'} was installed`;
+    console.log(`[TFgit] ${isTofu ? 'OpenTofu' : 'Terraform'} ${version} is installed and available on PATH${isTofu ? ' as both `tofu` and `terraform`' : ''}.`);
+    return '';
+  } catch (error) {
+    return error.message;
+  } finally {
+    try { fs.rmSync(archivePath, { force: true }); } catch { /* best-effort cleanup */ }
+  }
 }
 
 function ensureNonInteractiveTerraformArguments(args) {
