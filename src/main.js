@@ -877,7 +877,7 @@ async function installTerraform(requestedVersion, mode = 'terraform') {
   const releaseBase = isTofu
     ? `https://github.com/opentofu/opentofu/releases/download/v${encodeURIComponent(version)}`
     : `https://releases.hashicorp.com/terraform/${encodeURIComponent(version)}`;
-  const checksumName = isTofu ? `tofu_${version}_SHA256SUMS` : 'SHA256SUMS';
+  const checksumName = `${isTofu ? 'tofu' : 'terraform'}_${version}_SHA256SUMS`;
   const installDirectory = path.join(os.tmpdir(), `tfgit-${isTofu ? 'tofu' : 'terraform'}-${version}-${platform}-${architecture}`);
   const archivePath = path.join(os.tmpdir(), archiveName);
   const executableName = process.platform === 'win32' ? `${isTofu ? 'tofu' : 'terraform'}.exe` : (isTofu ? 'tofu' : 'terraform');
