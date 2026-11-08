@@ -85,6 +85,7 @@ async function main() {
   const prNumber = validation.pr_number || validation.pull_request_number;
   const requestedCommand = validation.command || '';
   const commandArgs = validation.command_args;
+  const mappedExecutionCommands = validation.execution_commands ?? [];
   if (Boolean(command) !== Boolean(requestedCommand)) {
     fail('tfgit response command does not match the dispatched workflow input.');
   }
@@ -140,7 +141,12 @@ async function main() {
     || !Array.isArray(postPlaybook) || !postPlaybook.every((item) => typeof item === 'string' && item.trim())) {
     fail('tfgit response pre_playbook and post_playbook must be arrays of non-empty command strings.');
   }
-  if (requestedCommand && (!Array.isArray(commandArgs) || commandArgs.length === 0
+  if (!Array.isArray(mappedExecutionCommands)
+    || !mappedExecutionCommands.every((item) => typeof item === 'string' && item.trim())) {
+    fail('tfgit response execution_commands must be an array of non-empty command strings.');
+  }
+  if (requestedCommand && mappedExecutionCommands.length === 0
+    && (!Array.isArray(commandArgs) || commandArgs.length === 0
     || !commandArgs.every((arg) => typeof arg === 'string'))) {
     fail('tfgit response must include valid parsed Terraform command arguments.');
   }
@@ -187,25 +193,29 @@ async function main() {
     GITHUB_PR_HEAD_SHA: pullRequest.head.sha || '',
     GITHUB_PR_IS_DRAFT: String(Boolean(pullRequest.draft)),
   };
-  const expandedCommandArgs = requestedCommand
+  const expandedCommandArgs = requestedCommand && Array.isArray(commandArgs)
     ? commandArgs.map((argument) => argument
       .replaceAll('${GITHUB_PR_BASE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH)
       .replaceAll('${GITHUB_REPO_NAME}', pullRequestEnvironment.GITHUB_REPO_NAME))
     : [];
+  const expandedExecutionCommands = mappedExecutionCommands.map((command) => command
+    .replaceAll('${GITHUB_PR_BASE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH)
+    .replaceAll('${GITHUB_REPO_NAME}', pullRequestEnvironment.GITHUB_REPO_NAME));
   for (const [name, value] of Object.entries(pullRequestEnvironment)) {
     process.env[name] = String(value).replaceAll('\0', '');
   }
   console.log(`[TFgit] Loaded PR #${pullRequestEnvironment.GITHUB_PR_NUMBER}: ${pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY} base branch ${pullRequestEnvironment.GITHUB_PR_BASE_BRANCH}, head ${pullRequestEnvironment.GITHUB_PR_HEAD_SHA}.`);
 
-  const expandedCommentCommand = requestedCommand
+  const expandedCommentCommand = requestedCommand && expandedCommandArgs.length
     ? `terraform ${expandedCommandArgs.map((argument) => /\s/.test(argument) ? JSON.stringify(argument) : argument).join(' ')}`
-    : '';
-  const mainPlaybook = requestedCommand ? [expandedCommentCommand] : playbook;
-  const commentCommandIndex = requestedCommand ? 0 : -1;
+    : requestedCommand;
+  const hasMappedCommand = expandedExecutionCommands.length > 0;
+  const mainPlaybook = hasMappedCommand ? expandedExecutionCommands : (requestedCommand ? [expandedCommentCommand] : playbook);
+  const commentCommandIndex = requestedCommand && !hasMappedCommand ? 0 : -1;
   const planIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
-    .some((item) => /^\s*terraform\s+plan(?:\s|$)/i.test(item));
+    .some((item) => /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(item));
   const applyIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
-    .some((item) => /^\s*terraform\s+apply(?:\s|$)/i.test(item));
+    .some((item) => /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(item));
   const useSavedWorkspace = applyIsRequested && !planIsRequested;
   if (useSavedWorkspace) {
     console.log(`[TFgit] Apply-only run detected. Looking for a saved plan workspace for PR #${prNumber} at the current head SHA.`);
