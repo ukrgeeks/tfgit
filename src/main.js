@@ -175,6 +175,25 @@ async function main() {
     || typeof validation.tfstate_token !== 'string' || !validation.tfstate_token)) {
     fail('TFgit state storage is enabled, but no scoped state-storage authorization was returned.');
   }
+  const workspaceStorageEnabled = validation.workspace_storage_enabled === true;
+  const workspaceStoragePath = safeStoragePath(validation.workspace_storage_path || '.');
+  const workspaceStoragePolicy = validation.workspace_storage_policy || 'after_command_success';
+  const workspaceStorageCommand = String(validation.workspace_storage_command || 'terraform plan').trim();
+  const workspaceRestorePolicy = validation.workspace_restore_policy === 'apply'
+    ? 'always'
+    : (validation.workspace_restore_policy || 'always');
+  const workspaceRestoreComment = String(validation.workspace_restore_comment || '').trim();
+  if (validation.workspace_storage_enabled !== undefined && typeof validation.workspace_storage_enabled !== 'boolean') {
+    fail('tfgit response workspace_storage_enabled must be a boolean.');
+  }
+  if (!['always', 'after_command_success'].includes(workspaceStoragePolicy)
+    || (workspaceStorageEnabled && workspaceStoragePolicy === 'after_command_success' && !workspaceStorageCommand)) {
+    fail('tfgit response contains invalid workspace storage save settings.');
+  }
+  if (!['always', 'after_pr_comment'].includes(workspaceRestorePolicy)
+    || (workspaceStorageEnabled && workspaceRestorePolicy === 'after_pr_comment' && !workspaceRestoreComment)) {
+    fail('tfgit response contains invalid workspace storage restore settings.');
+  }
 
   const pullRequest = await getPullRequestDetails(owner, repo, prNumber, apiHeaders);
   console.log(`[TFgit] Selected playbook: ${playbookName}.`);
@@ -216,11 +235,29 @@ async function main() {
     .some((item) => /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(item));
   const applyIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
     .some((item) => /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(item));
-  const useSavedWorkspace = applyIsRequested && !planIsRequested;
-  if (useSavedWorkspace) {
-    console.log(`[TFgit] Apply-only run detected. Looking for a saved plan workspace for PR #${prNumber} at the current head SHA.`);
+  const normalizedRequestedComment = requestedCommand.trim().split(/\s+/).join(' ').toLocaleLowerCase();
+  const normalizedRestoreComment = workspaceRestoreComment.split(/\s+/).join(' ').toLocaleLowerCase();
+  const restoreWorkspaceThisRun = workspaceStorageEnabled && (
+    workspaceRestorePolicy === 'always'
+    || (workspaceRestorePolicy === 'after_pr_comment'
+      && normalizedRequestedComment !== ''
+      && normalizedRequestedComment === normalizedRestoreComment)
+  );
+  if (workspaceStorageEnabled) {
+    const restoreDescription = workspaceRestorePolicy === 'always'
+      ? 'every run'
+      : `PR comment "${workspaceRestoreComment}"`;
+    console.log(`[TFgit] Workspace restore policy: ${restoreDescription}${restoreWorkspaceThisRun ? ' (restore selected for this run).' : ' (restore skipped for this run).'}`);
+  }
+  const applyNeedsWorkspace = applyIsRequested && !planIsRequested && restoreWorkspaceThisRun;
+  if (applyNeedsWorkspace && !validation.storage_token) {
+    fail('Workspace storage is enabled, but TFgit storage is unavailable. Configure STORAGE_SECRET on the TFgit storage service.');
+  }
+  const canRestoreBeforeCheckout = applyNeedsWorkspace && workspaceStoragePath === '.';
+  if (canRestoreBeforeCheckout) {
+    console.log(`[TFgit] Apply-only run detected. Looking for saved files at ${workspaceStoragePath} for PR #${prNumber} and the current head SHA.`);
     const restored = await restoreWorkspace(serviceUrl, validation.storage_token, workspace, prNumber,
-      pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName);
+      pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName, workspaceStoragePath, true);
     if (restored.missing) {
       await reportRunState(serviceUrl, {
         secret,
@@ -229,22 +266,49 @@ async function main() {
         run_id: process.env.GITHUB_RUN_ID || '',
         run_attempt: process.env.GITHUB_RUN_ATTEMPT || '1',
         status: 'failure',
-        output: 'There is no saved plan for this pull request. Please execute `terraform plan` first.',
+        output: `There is no saved workspace for this pull request. Please run the configured storage command: ${workspaceStorageCommand}.`,
         run_url: `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`,
         plan_ready: false,
         apply_success: false,
       });
       await postPullRequestComment(owner, repo, prNumber, apiHeaders,
-        'There is no saved plan for this pull request. Please execute `terraform plan` first.');
-      fail('No saved plan was found for this pull request. Run terraform plan first.');
+        `There is no saved workspace for this pull request. Please run the configured storage command: ${workspaceStorageCommand}.`);
+      fail('No saved workspace was found for this pull request.');
     }
-    if (restored.error) fail(`Could not restore the saved Terraform workspace: ${restored.error}`);
+    if (restored.error) fail(`Could not restore saved workspace files: ${restored.error}`);
   } else {
-    console.log(`[TFgit] No apply-only restore required. Fetching PR #${prNumber} source at head ${pullRequestEnvironment.GITHUB_PR_HEAD_SHA}.`);
+    console.log(`[TFgit] Fetching PR #${prNumber} source at head ${pullRequestEnvironment.GITHUB_PR_HEAD_SHA}.`);
     const checkoutError = await checkoutPullRequestHead(owner, repo, pullRequestEnvironment.GITHUB_PR_HEAD_SHA,
       apiHeaders, workspace);
     if (checkoutError) fail(`Could not fetch the pull request workspace: ${checkoutError}`);
     console.log(`[TFgit] PR #${prNumber} source is ready in the runner workspace.`);
+    if (restoreWorkspaceThisRun && validation.storage_token) {
+      console.log(`[TFgit] Looking for saved files at ${workspaceStoragePath} to reuse for this run.`);
+      const restored = await restoreWorkspace(serviceUrl, validation.storage_token, workspace, prNumber,
+        pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName, workspaceStoragePath, workspaceStoragePath === '.');
+      if (restored.error) fail(`Could not restore saved workspace files: ${restored.error}`);
+      if (restored.missing && !applyNeedsWorkspace) {
+        console.log('[TFgit] No saved execution files were found; continuing with the checked-out PR files.');
+      }
+      if (restored.missing && applyNeedsWorkspace) {
+        await reportRunState(serviceUrl, {
+          secret, repository: repoFullName, pull_request_number: Number(prNumber),
+          run_id: process.env.GITHUB_RUN_ID || '', run_attempt: process.env.GITHUB_RUN_ATTEMPT || '1',
+          status: 'failure', output: 'No saved workspace was found for this pull request. Run the configured save command first.',
+          run_url: `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+          plan_ready: false, apply_success: false,
+        });
+        await postPullRequestComment(owner, repo, prNumber, apiHeaders,
+          'No saved workspace was found for this pull request. Run the configured save command first.');
+        fail('No saved workspace was found for this pull request.');
+      }
+      if (restored.restored) console.log('[TFgit] Saved files are ready before the pre-playbook.');
+    } else if (workspaceStorageEnabled) {
+      const restoreReason = workspaceRestorePolicy === 'always'
+        ? 'storage is unavailable'
+        : 'the PR comment does not match the configured restore comment';
+      console.log(`[TFgit] Saved files will not be restored because ${restoreReason}.`);
+    }
   }
 
   if (backendEnabled) {
@@ -305,8 +369,13 @@ async function main() {
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
   const runUrl = `https://github.com/${repoFullName}/actions/runs/${process.env.GITHUB_RUN_ID}`;
   const runStatus = steps.some((step) => step.status !== 'success') ? 'failure' : 'success';
+  const planSteps = steps.filter((step) => /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
+  const successfulPlan = planSteps.length > 0 && planSteps.at(-1).status === 'success';
+  const applySteps = steps.filter((step) => /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
+  const successfulApply = applySteps.length > 0 && applySteps.at(-1).status === 'success';
   let storageTransferFailed = false;
-  if (stateStorageEnabled && terraformStateFile && fs.existsSync(terraformStateFile)) {
+  let workspaceSaved = false;
+  if (stateStorageEnabled && successfulApply && terraformStateFile && fs.existsSync(terraformStateFile)) {
     console.log(`[TFgit] Uploading the updated Terraform state file for ${validation.tfstate_key}.`);
     const stateError = await saveTerraformState(serviceUrl, validation.tfstate_token, validation.tfstate_key,
       terraformStateFile);
@@ -319,23 +388,25 @@ async function main() {
       console.log('[TFgit] Terraform state file uploaded successfully.');
     }
   }
-  const planSteps = steps.filter((step) => /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
-  const successfulPlan = planSteps.length > 0 && planSteps.at(-1).status === 'success';
-  const applySteps = steps.filter((step) => /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
-  const successfulApply = applySteps.length > 0 && applySteps.at(-1).status === 'success';
-  if (successfulPlan && !storageTransferFailed) {
-    console.log('[TFgit] Terraform plan succeeded. Packaging the runner workspace for a later apply.');
+  const successfulStorageTrigger = steps.some((step) => step.status === 'success'
+    && commandMatchesStorageTrigger(step.command, workspaceStorageCommand));
+  const shouldSaveWorkspace = workspaceStorageEnabled && !storageTransferFailed
+    && (workspaceStoragePolicy === 'always' || successfulStorageTrigger);
+  if (shouldSaveWorkspace) {
+    console.log(`[TFgit] Storage save condition met (${workspaceStoragePolicy === 'always' ? 'always' : `successful command: ${workspaceStorageCommand}`}). Packaging ${workspaceStoragePath}.`);
     const storageError = await saveWorkspace(serviceUrl, validation.storage_token, workspace,
-      pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName, prNumber);
+      pullRequestEnvironment.GITHUB_PR_HEAD_SHA, secret, repoFullName, prNumber, workspaceStoragePath);
     if (storageError) {
       storageTransferFailed = true;
       console.error(`::warning::Could not save the Terraform workspace: ${storageError}`);
       await postPullRequestComment(owner, repo, prNumber, apiHeaders,
-        'TFgit could not save this plan workspace. Apply will be unavailable until a plan is saved successfully.');
-    }
+        'TFgit could not save these execution files. A later run may not be able to reuse this workspace.');
+    } else workspaceSaved = true;
+  } else if (workspaceStorageEnabled) {
+    console.log(`[TFgit] Workspace storage save skipped; ${workspaceStoragePolicy === 'always' ? 'a prior storage transfer failed' : `command did not succeed: ${workspaceStorageCommand}`}.`);
   }
   if (successfulApply) {
-    console.log('[TFgit] Terraform apply succeeded. Deleting the saved plan workspace.');
+    console.log('[TFgit] Terraform apply succeeded. Deleting temporary execution files.');
     await deleteWorkspace(serviceUrl, validation.storage_token);
   }
   console.log(`[TFgit] Reporting ${storageTransferFailed ? 'failure' : runStatus} status to the TFgit dashboard.`);
@@ -352,7 +423,7 @@ async function main() {
         status: storageTransferFailed ? 'failure' : runStatus,
         plan_ready: successfulApply
           ? false
-          : (planIsRequested ? successfulPlan && !storageTransferFailed : null),
+          : (planIsRequested ? successfulPlan && workspaceSaved && !storageTransferFailed : null),
         apply_success: applyIsRequested ? successfulApply && !storageTransferFailed : (planIsRequested ? false : null),
         output: (storageTransferFailed
           ? `${playbookOutput}\n\nTFgit could not persist Terraform state or plan data; apply may be unavailable until storage is healthy.`
@@ -495,13 +566,30 @@ async function saveTerraformState(serviceUrl, stateToken, stateKey, stateFile) {
   }
 }
 
-async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, headSha, secret, repoFullName) {
+function safeStoragePath(value) {
+  const storagePath = String(value || '.').trim();
+  if (storagePath === '.') return storagePath;
+  if (!storagePath || storagePath.length > 500 || storagePath.startsWith('/') || storagePath.includes('\\')
+    || storagePath.split('/').some((part) => !part || part === '.' || part === '..')
+    || !/^[A-Za-z0-9_.@+-]+(?:\/[A-Za-z0-9_.@+-]+)*$/.test(storagePath)) {
+    fail('TFgit response contains an unsafe workspace storage path.');
+  }
+  return storagePath;
+}
+
+function commandMatchesStorageTrigger(executionCommand, configuredCommand) {
+  const executed = String(executionCommand || '').trim().replace(/\s+/g, ' ');
+  const trigger = String(configuredCommand || '').trim().replace(/\s+/g, ' ');
+  return executed === trigger || executed.startsWith(`${trigger} `);
+}
+
+async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, headSha, secret, repoFullName, storagePath = '.', replaceWorkspace = true) {
   if (!storageToken) return { error: 'storage is not configured; set STORAGE_SECRET on the backend and storage service' };
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tfgit-storage-'));
   const encryptedArchive = path.join(tempDir, 'workspace.tfgit.enc');
   const archive = path.join(tempDir, 'workspace.tar.gz');
   try {
-    console.log(`[TFgit] Downloading the saved plan workspace for PR #${prNumber} from TFgit storage.`);
+    console.log(`[TFgit] Downloading saved workspace files for PR #${prNumber} from TFgit storage.`);
     const result = spawnSync('curl', [
       '--silent', '--show-error', '--location', '--max-filesize', String(MAX_STORAGE_ARCHIVE_BYTES),
       '--output', encryptedArchive, '--write-out', '%{http_code}',
@@ -522,15 +610,20 @@ async function restoreWorkspace(serviceUrl, storageToken, workspace, prNumber, h
     const listing = spawnSync('tar', ['-tzf', archive], { encoding: 'utf8', timeout: 2 * 60 * 1000, maxBuffer: 20 * 1024 * 1024 });
     if (listing.error || listing.status !== 0) return { error: 'could not inspect the saved workspace archive' };
     const entries = listing.stdout.split('\n').filter(Boolean);
-    if (!entries.length || entries.some((entry) => path.isAbsolute(entry) || entry.includes('\\') || entry.split('/').includes('..'))) {
+    const normalizedEntries = entries.map((entry) => entry.replace(/^\.\//, '').replace(/\/$/, ''));
+    if (!normalizedEntries.length || normalizedEntries.some((entry) => path.isAbsolute(entry) || entry.includes('\\') || entry.split('/').includes('..'))) {
       return { error: 'archive contains an unsafe path' };
     }
-    clearWorkspaceContents(workspace);
+    if (storagePath !== '.' && normalizedEntries.some((entry) => entry !== storagePath && !entry.startsWith(`${storagePath}/`))) {
+      return { error: 'archive contains files outside the configured storage path' };
+    }
+    if (replaceWorkspace) clearWorkspaceContents(workspace);
+    else if (storagePath !== '.') clearWorkspacePath(workspace, storagePath);
     const extract = spawnSync('tar', ['-xzf', archive, '-C', workspace, '--no-same-owner', '--no-same-permissions'], {
       encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024,
     });
     if (extract.error || extract.status !== 0) return { error: extract.stderr || 'archive extraction failed' };
-    console.log(`[TFgit] Restored saved plan workspace for PR #${prNumber}; files are ready before the pre-playbook.`);
+    console.log(`[TFgit] Restored saved files from ${storagePath} for PR #${prNumber}.`);
     return { restored: true };
   } catch (error) {
     return { error: error.message };
@@ -603,16 +696,30 @@ function clearWorkspaceContents(workspace) {
   return workspacePath;
 }
 
-async function saveWorkspace(serviceUrl, storageToken, workspace, headSha, secret, repoFullName, prNumber) {
+function clearWorkspacePath(workspace, storagePath) {
+  const root = path.resolve(workspace);
+  const target = path.resolve(root, storagePath);
+  if (!target.startsWith(`${root}${path.sep}`)) throw new Error('storage path escapes the runner workspace');
+  let current = root;
+  for (const part of path.relative(root, target).split(path.sep).slice(0, -1)) {
+    current = path.join(current, part);
+    if (!fs.existsSync(current)) break;
+    if (fs.lstatSync(current).isSymbolicLink()) throw new Error('storage path crosses a symbolic link');
+  }
+  if (fs.existsSync(target) && fs.lstatSync(target).isSymbolicLink()) throw new Error('storage path cannot be a symbolic link');
+  fs.rmSync(target, { recursive: true, force: true });
+}
+
+async function saveWorkspace(serviceUrl, storageToken, workspace, headSha, secret, repoFullName, prNumber, storagePath = '.') {
   if (!storageToken) return 'storage is not configured; set STORAGE_SECRET on the backend and storage service';
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tfgit-storage-'));
   const archive = path.join(tempDir, 'workspace.tar.gz');
   const encryptedArchive = path.join(tempDir, 'workspace.tfgit.enc');
   try {
     const filesList = path.join(tempDir, 'files.list');
-    const files = collectWorkspaceFiles(workspace);
+    const files = collectWorkspaceFiles(workspace, storagePath);
     if (!files.length) return 'the workspace contains no regular files to save';
-    console.log(`[TFgit] Packaging ${files.length} workspace file(s) for saved plan storage.`);
+    console.log(`[TFgit] Packaging ${files.length} file(s) from ${storagePath} for workspace storage.`);
     fs.writeFileSync(filesList, files.map((file) => `./${file}`).join('\0') + '\0');
     const tar = spawnSync('tar', ['-czf', archive, '--null', '-T', filesList], {
       cwd: workspace, encoding: 'utf8', timeout: 10 * 60 * 1000, maxBuffer: 1024 * 1024,
@@ -707,8 +814,16 @@ function formatDuration(milliseconds) {
   return minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
 }
 
-function collectWorkspaceFiles(workspace) {
+function collectWorkspaceFiles(workspace, storagePath = '.') {
   const root = path.resolve(workspace);
+  const selectedRoot = storagePath === '.' ? root : path.resolve(root, storagePath);
+  if (!selectedRoot.startsWith(`${root}${path.sep}`) && selectedRoot !== root) throw new Error('storage path escapes the runner workspace');
+  if (!fs.existsSync(selectedRoot)) throw new Error(`storage path does not exist: ${storagePath}`);
+  let inspected = root;
+  for (const part of path.relative(root, selectedRoot).split(path.sep).filter(Boolean)) {
+    inspected = path.join(inspected, part);
+    if (fs.lstatSync(inspected).isSymbolicLink()) throw new Error('storage path cannot cross a symbolic link');
+  }
   const files = [];
   const visit = (directory) => {
     for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
@@ -718,7 +833,11 @@ function collectWorkspaceFiles(workspace) {
       else if (entry.isFile()) files.push(path.relative(root, absolute));
     }
   };
-  visit(root);
+  const selectedStat = fs.lstatSync(selectedRoot);
+  if (selectedStat.isSymbolicLink()) throw new Error('storage path cannot be a symbolic link');
+  if (selectedStat.isFile()) files.push(path.relative(root, selectedRoot));
+  else if (selectedStat.isDirectory()) visit(selectedRoot);
+  else throw new Error('storage path must select a regular file or folder');
   return files.sort();
 }
 
