@@ -175,14 +175,20 @@ async function main() {
     || typeof validation.tfstate_token !== 'string' || !validation.tfstate_token)) {
     fail('TFgit state storage is enabled, but no scoped state-storage authorization was returned.');
   }
-  const workspaceStorageEnabled = validation.workspace_storage_enabled === true;
-  const workspaceStoragePath = safeStoragePath(validation.workspace_storage_path || '.');
-  const workspaceStoragePolicy = validation.workspace_storage_policy || 'after_command_success';
-  const workspaceStorageCommand = String(validation.workspace_storage_command || 'terraform plan').trim();
-  const workspaceRestorePolicy = validation.workspace_restore_policy === 'apply'
-    ? 'always'
-    : (validation.workspace_restore_policy || 'always');
-  const workspaceRestoreComment = String(validation.workspace_restore_comment || '').trim();
+  if (validation.storage_actions !== undefined && (!Array.isArray(validation.storage_actions)
+    || validation.storage_actions.length > 2
+    || validation.storage_actions.some((item) => !item || !['temporary', 'permanent'].includes(item.type)))) {
+    fail('TFgit response contains invalid storage actions.');
+  }
+  const storageActions = Array.isArray(validation.storage_actions) ? validation.storage_actions : null;
+  const temporaryStorage = storageActions?.find((item) => item.type === 'temporary');
+  const permanentStorage = storageActions?.find((item) => item.type === 'permanent');
+  const workspaceStorageEnabled = storageActions ? Boolean(temporaryStorage) : validation.workspace_storage_enabled === true;
+  const workspaceStoragePath = safeStoragePath(temporaryStorage?.path || validation.workspace_storage_path || '.');
+  const workspaceStorageCommand = String(temporaryStorage?.store_command ?? validation.workspace_storage_command ?? 'terraform plan').trim();
+  const workspaceRestoreComment = String(temporaryStorage?.restore_command ?? validation.workspace_restore_comment ?? '').trim();
+  const workspaceStoragePolicy = workspaceStorageCommand ? 'after_command_success' : 'always';
+  const workspaceRestorePolicy = workspaceRestoreComment ? 'after_pr_comment' : 'always';
   if (validation.workspace_storage_enabled !== undefined && typeof validation.workspace_storage_enabled !== 'boolean') {
     fail('tfgit response workspace_storage_enabled must be a boolean.');
   }
@@ -235,13 +241,9 @@ async function main() {
     .some((item) => /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(item));
   const applyIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
     .some((item) => /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(item));
-  const normalizedRequestedComment = requestedCommand.trim().split(/\s+/).join(' ').toLocaleLowerCase();
-  const normalizedRestoreComment = workspaceRestoreComment.split(/\s+/).join(' ').toLocaleLowerCase();
+  const workspaceRestoreCommands = [...prePlaybook, ...mainPlaybook, ...postPlaybook, ...expandedExecutionCommands];
   const restoreWorkspaceThisRun = workspaceStorageEnabled && (
-    workspaceRestorePolicy === 'always'
-    || (workspaceRestorePolicy === 'after_pr_comment'
-      && normalizedRequestedComment !== ''
-      && normalizedRequestedComment === normalizedRestoreComment)
+    !workspaceRestoreComment || workspaceRestoreCommands.some((command) => commandMatchesStorageTrigger(command, workspaceRestoreComment))
   );
   if (workspaceStorageEnabled) {
     const restoreDescription = workspaceRestorePolicy === 'always'
@@ -304,9 +306,9 @@ async function main() {
       }
       if (restored.restored) console.log('[TFgit] Saved files are ready before the pre-playbook.');
     } else if (workspaceStorageEnabled) {
-      const restoreReason = workspaceRestorePolicy === 'always'
+      const restoreReason = !validation.storage_token
         ? 'storage is unavailable'
-        : 'the PR comment does not match the configured restore comment';
+        : `no scheduled command matches ${workspaceRestoreComment}`;
       console.log(`[TFgit] Saved files will not be restored because ${restoreReason}.`);
     }
   }
@@ -341,16 +343,27 @@ async function main() {
     console.log('Terraform backend injection is disabled; leaving backend.tf unchanged.');
   }
   let terraformStateFile = '';
+  const stateRestoreCommand = String(validation.tfstate_restore_command ?? permanentStorage?.restore_command ?? '').trim();
+  const stateRestoreThisRun = !stateRestoreCommand
+    || [...prePlaybook, ...mainPlaybook, ...postPlaybook, ...expandedExecutionCommands]
+      .some((command) => commandMatchesStorageTrigger(command, stateRestoreCommand));
   if (stateStorageEnabled) {
     const expectedStateKey = `${pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY}/${pullRequestEnvironment.GITHUB_PR_BASE_BRANCH}`;
     if (validation.tfstate_key !== expectedStateKey) {
       fail('TFgit returned a state key that does not match this PR repository and base branch.');
     }
-    const stateFileName = `${pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY}-${pullRequestEnvironment.GITHUB_PR_BASE_BRANCH}.tfstate`;
+    const stateFileName = String(validation.tfstate_path || '${GITHUB_PR_BASE_REPOSITORY}-${TFGIT_STATE_BRANCH}.tfstate')
+      .replaceAll('${GITHUB_PR_BASE_REPOSITORY}', pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY)
+      .replaceAll('${TFGIT_STATE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH);
     terraformStateFile = safeWorkspaceFile(workspace, stateFileName);
-    const restoreState = await restoreTerraformState(serviceUrl, validation.tfstate_token, validation.tfstate_key,
-      terraformStateFile);
-    if (restoreState.error) fail(`Could not restore Terraform state: ${restoreState.error}`);
+    if (stateRestoreThisRun) {
+      console.log(`[TFgit] Restoring permanent state file ${stateFileName}.`);
+      const restoreState = await restoreTerraformState(serviceUrl, validation.tfstate_token, validation.tfstate_key,
+        terraformStateFile);
+      if (restoreState.error) fail(`Could not restore Terraform state: ${restoreState.error}`);
+    } else {
+      console.log(`[TFgit] Skipping permanent state restore; no scheduled command matches "${stateRestoreCommand}".`);
+    }
   }
   if (planIsRequested && validation.storage_token) {
     console.log('[TFgit] Removing any previous saved plan workspace before starting a new plan.');
@@ -375,7 +388,11 @@ async function main() {
   const successfulApply = applySteps.length > 0 && applySteps.at(-1).status === 'success';
   let storageTransferFailed = false;
   let workspaceSaved = false;
-  if (stateStorageEnabled && successfulApply && terraformStateFile && fs.existsSync(terraformStateFile)) {
+  const stateStoreCommand = String(validation.tfstate_store_command ?? permanentStorage?.store_command ?? '').trim();
+  const successfulStateStoreTrigger = stateStoreCommand
+    ? steps.some((step) => step.status === 'success' && commandMatchesStorageTrigger(step.command, stateStoreCommand))
+    : runStatus === 'success';
+  if (stateStorageEnabled && successfulStateStoreTrigger && terraformStateFile && fs.existsSync(terraformStateFile)) {
     console.log(`[TFgit] Uploading the updated Terraform state file for ${validation.tfstate_key}.`);
     const stateError = await saveTerraformState(serviceUrl, validation.tfstate_token, validation.tfstate_key,
       terraformStateFile);
@@ -388,8 +405,9 @@ async function main() {
       console.log('[TFgit] Terraform state file uploaded successfully.');
     }
   }
-  const successfulStorageTrigger = steps.some((step) => step.status === 'success'
-    && commandMatchesStorageTrigger(step.command, workspaceStorageCommand));
+  const successfulStorageTrigger = workspaceStorageCommand
+    ? steps.some((step) => step.status === 'success' && commandMatchesStorageTrigger(step.command, workspaceStorageCommand))
+    : runStatus === 'success';
   const shouldSaveWorkspace = workspaceStorageEnabled && !storageTransferFailed
     && (workspaceStoragePolicy === 'always' || successfulStorageTrigger);
   if (shouldSaveWorkspace) {
