@@ -1260,7 +1260,7 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
     && /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
   if (successfulPlan && planSummaryEnabled) {
     const resourcesByAction = { create: new Set(), delete: new Set(), update: new Set(), read: new Set() };
-    const actionLine = /^#\s+(.+?)\s+(?:will be (created|updated in-place|destroyed|read during apply|replaced)|must be replaced|is tainted, so must be replaced)\s*$/gm;
+    const actionLine = /^\s*#\s+(.+?)\s+(?:will be (created|updated in-place|destroyed|read during apply|replaced)|must be replaced|is tainted, so must be replaced)\s*$/gm;
     for (const match of successfulPlan.output.matchAll(actionLine)) {
       const address = match[1].trim();
       const action = match[2];
