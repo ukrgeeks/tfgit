@@ -1221,6 +1221,9 @@ function stripTerminalSequences(value) {
 
 function buildOutputComments(output, runUrl, command = '', summaries = [], errorLabel = '') {
   // Keep substantial headroom below GitHub's per-comment body limit for Markdown wrappers.
+  const resourceSummary = summaries.find((summary) => summary.startsWith('SUMMARY\n'));
+  const visibleSummaries = summaries.filter((summary) => summary !== resourceSummary);
+  if (resourceSummary) output = insertPlanSummary(output, resourceSummary);
   const chunkSize = 48000;
   const chunks = [];
   for (let offset = 0; offset < output.length;) {
@@ -1246,8 +1249,26 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
     '````',
     '',
     '</details>',
-    ...(index === chunks.length - 1 && summaries.length ? ['', summaries.join('\n\n')] : []),
+    ...(index === chunks.length - 1 && visibleSummaries.length ? ['', visibleSummaries.join('\n\n')] : []),
   ].join('\n'));
+}
+
+function insertPlanSummary(output, summary) {
+  const lines = output.split('\n');
+  const outputHeader = lines.findIndex((line) => /^\s*Changes to Outputs:\s*$/.test(line));
+  if (outputHeader < 0) return `${output}\n\n${summary}`;
+
+  let insertAt = outputHeader + 1;
+  while (insertAt < lines.length) {
+    const line = lines[insertAt];
+    if (/^\s*[-_]{5,}\s*$/.test(line) || /^\s*Note:/.test(line)) break;
+    if (line.trim()) insertAt += 1;
+    else if (insertAt + 1 < lines.length && lines[insertAt + 1].trim()
+      && !/^\s*[-_]{5,}\s*$/.test(lines[insertAt + 1]) && !/^\s*Note:/.test(lines[insertAt + 1])) insertAt += 1;
+    else break;
+  }
+  lines.splice(insertAt, 0, '', summary);
+  return lines.join('\n');
 }
 
 function summarizeTerraformResults(steps, planSummaryEnabled = true) {
@@ -1274,10 +1295,9 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
       }
     }
     const resourceSummary = [
-      ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'], ['read', 'read'],
-    ].flatMap(([action, label]) => [...resourcesByAction[action]].sort()
-      .map((address) => `- ${label} — \`${address}\``));
-    if (resourceSummary.length) summaries.push(`**Terraform plan resource changes**\n\n${resourceSummary.join('\n')}`);
+      ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'],
+    ].map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
+    summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
 
     const counts = successfulPlan.output.match(planSummaryPattern);
     const noChanges = /No changes\. Your infrastructure matches the configuration\./i.test(successfulPlan.output);
