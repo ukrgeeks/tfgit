@@ -134,6 +134,10 @@ async function main() {
   }
 
   const playbook = validation.playbook;
+  const planSummaryEnabled = mode !== 'custom' && validation.terraform_plan_summary_enabled !== false;
+  if (validation.terraform_plan_summary_enabled !== undefined && typeof validation.terraform_plan_summary_enabled !== 'boolean') {
+    fail('tfgit response terraform_plan_summary_enabled must be a boolean.');
+  }
   const playbookName = validation.playbook_name || 'Default';
   const prePlaybook = validation.pre_playbook ?? (mode === 'custom' ? [] : ['terraform init']);
   const postPlaybook = validation.post_playbook ?? [];
@@ -453,7 +457,7 @@ async function main() {
   } catch (error) {
     console.error(`::warning::Could not reach the tfgit dashboard to save run output: ${error.message}`);
   }
-  const commentSummaries = summarizeTerraformResults(steps);
+  const commentSummaries = summarizeTerraformResults(steps, planSummaryEnabled);
   const commentBodies = buildOutputComments(playbookOutput, runUrl, expandedCommentCommand || requestedCommand,
     commentSummaries.lines, commentSummaries.errorLabel);
   console.log(`[TFgit] Posting ${commentBodies.length} output comment(s) to PR #${prNumber}.`);
@@ -1246,7 +1250,7 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
   ].join('\n'));
 }
 
-function summarizeTerraformResults(steps) {
+function summarizeTerraformResults(steps, planSummaryEnabled = true) {
   const summaries = [];
   const failedPlan = steps.find((step) => step.status !== 'success' && /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
   const failedApply = steps.find((step) => step.status !== 'success' && /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
@@ -1254,7 +1258,26 @@ function summarizeTerraformResults(steps) {
   const planSummaryPattern = /Plan:\s*(\d+)\s+to add,\s*(\d+)\s+to change,\s*(\d+)\s+to destroy\./i;
   const successfulPlan = steps.find((step) => step.status === 'success'
     && /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
-  if (successfulPlan) {
+  if (successfulPlan && planSummaryEnabled) {
+    const resourcesByAction = { create: new Set(), delete: new Set(), update: new Set(), read: new Set() };
+    const actionLine = /^#\s+(.+?)\s+(?:will be (created|updated in-place|destroyed|read during apply|replaced)|must be replaced|is tainted, so must be replaced)\s*$/gm;
+    for (const match of successfulPlan.output.matchAll(actionLine)) {
+      const address = match[1].trim();
+      const action = match[2];
+      if (action === 'created') resourcesByAction.create.add(address);
+      else if (action === 'destroyed') resourcesByAction.delete.add(address);
+      else if (action === 'updated in-place') resourcesByAction.update.add(address);
+      else if (action === 'read during apply') resourcesByAction.read.add(address);
+      else {
+        resourcesByAction.delete.add(address);
+        resourcesByAction.create.add(address);
+      }
+    }
+    const resourceSummary = ['delete', 'create', 'update', 'read']
+      .filter((action) => resourcesByAction[action].size > 0)
+      .map((action) => `**${action}:**\n${[...resourcesByAction[action]].sort().map((address) => `- \`${address}\``).join('\n')}`);
+    if (resourceSummary.length) summaries.push(`**Terraform plan resources by address**\n\n${resourceSummary.join('\n\n')}`);
+
     const counts = successfulPlan.output.match(planSummaryPattern);
     const noChanges = /No changes\. Your infrastructure matches the configuration\./i.test(successfulPlan.output);
     const planLine = counts
