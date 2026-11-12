@@ -1273,10 +1273,11 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
         resourcesByAction.create.add(address);
       }
     }
-    const resourceSummary = ['delete', 'create', 'update', 'read']
-      .filter((action) => resourcesByAction[action].size > 0)
-      .map((action) => `**${action}:**\n${[...resourcesByAction[action]].sort().map((address) => `- \`${address}\``).join('\n')}`);
-    if (resourceSummary.length) summaries.push(`**Terraform plan resources by address**\n\n${resourceSummary.join('\n\n')}`);
+    const resourceSummary = [
+      ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'], ['read', 'read'],
+    ].flatMap(([action, label]) => [...resourcesByAction[action]].sort()
+      .map((address) => `- ${label} — \`${address}\``));
+    if (resourceSummary.length) summaries.push(`**Terraform plan resource changes**\n\n${resourceSummary.join('\n')}`);
 
     const counts = successfulPlan.output.match(planSummaryPattern);
     const noChanges = /No changes\. Your infrastructure matches the configuration\./i.test(successfulPlan.output);
