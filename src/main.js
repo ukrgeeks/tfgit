@@ -109,8 +109,6 @@ async function main() {
 
   if (validation.unknown_command === true) {
     const body = [
-      '### tfgit playbook output',
-      '',
       '<details>',
       '<summary>Expand to view reply</summary>',
       '',
@@ -1235,8 +1233,6 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
   }
   if (chunks.length === 0) chunks.push('(no output)');
   return chunks.map((chunk, index) => [
-    `### tfgit playbook output${chunks.length > 1 ? ` — part ${index + 1}/${chunks.length}` : ''}`,
-    '',
     ...(errorLabel ? [`**${errorLabel}**`, ''] : []),
     '<details>',
     `<summary>Show Output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
