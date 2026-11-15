@@ -13,6 +13,10 @@ inputs:
     description: Path on the tfgit service used to validate credentials
     required: false
     default: /api/v1/github-actions/validate
+  working_directory:
+    description: Relative path from the repository root where Terraform commands run
+    required: false
+    default: .
 runs:
   using: node20
   main: src/main.js

@@ -22,6 +22,7 @@ async function main() {
   const serviceUrl = process.env.TFGIT_URL || process.env.INPUT_SERVICE_URL || 'https://tfgit.ukrgeeks.com';
   const validationPath = process.env.INPUT_VALIDATION_PATH || '/api/v1/github-actions/validate';
   const workspace = process.env.GITHUB_WORKSPACE;
+  const workingDirectoryInput = process.env.INPUT_WORKING_DIRECTORY || '.';
   const repoFullName = process.env.GITHUB_REPOSITORY;
   const workflowToken = process.env.GITHUB_TOKEN;
   const pullRequestNumber = readPullRequestNumber();
@@ -30,6 +31,12 @@ async function main() {
   if (!secret) fail('Set TFGIT_SECRET in the step environment or provide the tfgit_secret input.');
   if (!workspace || !repoFullName) {
     fail('GITHUB_WORKSPACE and GITHUB_REPOSITORY must be available.');
+  }
+  if (path.isAbsolute(workingDirectoryInput)) fail('working_directory must be a relative path inside the repository.');
+  const executionDirectory = path.resolve(workspace, workingDirectoryInput);
+  const relativeExecutionDirectory = path.relative(path.resolve(workspace), executionDirectory);
+  if (relativeExecutionDirectory === '..' || relativeExecutionDirectory.startsWith(`..${path.sep}`) || path.isAbsolute(relativeExecutionDirectory)) {
+    fail('working_directory must stay inside the repository workspace.');
   }
 
   console.log(`[TFgit] Starting run for ${repoFullName}; GitHub run ${process.env.GITHUB_RUN_ID || 'unknown'}.`);
@@ -47,6 +54,7 @@ async function main() {
         run_attempt: process.env.GITHUB_RUN_ATTEMPT,
         pull_request_number: pullRequestNumber,
         command,
+        working_directory: relativeExecutionDirectory || '.',
       }),
     });
   } catch (error) {
@@ -223,7 +231,8 @@ async function main() {
   const expandedCommandArgs = requestedCommand && Array.isArray(commandArgs)
     ? commandArgs.map((argument) => argument
       .replaceAll('${GITHUB_PR_BASE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH)
-      .replaceAll('${GITHUB_REPO_NAME}', pullRequestEnvironment.GITHUB_REPO_NAME))
+      .replaceAll('${GITHUB_REPO_NAME}', pullRequestEnvironment.GITHUB_REPO_NAME)
+      .replaceAll('${TFGIT_WORKING_DIRECTORY}', relativeExecutionDirectory || '.'))
     : [];
   const expandedExecutionCommands = mappedExecutionCommands.map((command) => command
     .replaceAll('${GITHUB_PR_BASE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH)
@@ -315,7 +324,15 @@ async function main() {
     }
   }
 
+  if (fs.existsSync(executionDirectory)) {
+    let currentDirectory = path.resolve(workspace);
+    for (const part of relativeExecutionDirectory.split(path.sep).filter(Boolean)) {
+      currentDirectory = path.join(currentDirectory, part);
+      if (fs.lstatSync(currentDirectory).isSymbolicLink()) fail('working_directory cannot contain a symbolic link.');
+    }
+  }
   if (backendEnabled) {
+    fs.mkdirSync(executionDirectory, { recursive: true });
     console.log('[TFgit] Generating backend.tf from the selected backend configuration.');
     const baseBranch = pullRequestEnvironment.GITHUB_PR_BASE_BRANCH;
     const hclString = (value) => String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"');
@@ -324,13 +341,14 @@ async function main() {
       .replaceAll('${path.module}', hclString(workspace))
       .replaceAll('${GITHUB_REPO_NAME}', hclString(repo))
       .replaceAll('${GITHUB_PR_BASE_BRANCH}', hclString(baseBranch))
+      .replaceAll('${TFGIT_WORKING_DIRECTORY}', hclString(relativeExecutionDirectory || '.'))
       .replaceAll('${GITHUB_PR_BASE_REPOSITORY}', hclString(pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY))
       .replaceAll('${TFGIT_USERNAME}', hclString(validation.tfgit_username))
       .replaceAll('${TFGIT_SECRET}', hclString(secret))
       .replaceAll('${BASE_REPO_NAME}', hclString(repo))
       .replaceAll('${BASE_BRANCH_NAME}', hclString(baseBranch))
       .replaceAll('${AWS_DEFAULT_REGION}', hclString(process.env.AWS_DEFAULT_REGION || ''));
-    const backendFile = path.join(workspace, 'backend.tf');
+    const backendFile = path.join(executionDirectory, 'backend.tf');
     try {
       if (fs.lstatSync(backendFile).isSymbolicLink()) {
         fail('Refusing to overwrite backend.tf because it is a symbolic link.');
@@ -357,7 +375,7 @@ async function main() {
     const stateFileName = String(validation.tfstate_path || '${GITHUB_PR_BASE_REPOSITORY}-${TFGIT_STATE_BRANCH}.tfstate')
       .replaceAll('${GITHUB_PR_BASE_REPOSITORY}', pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY)
       .replaceAll('${TFGIT_STATE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH);
-    terraformStateFile = safeWorkspaceFile(workspace, stateFileName);
+    terraformStateFile = safeWorkspaceFile(executionDirectory, stateFileName);
     if (stateRestoreThisRun) {
       console.log(`[TFgit] Restoring permanent state file ${stateFileName}.`);
       const restoreState = await restoreTerraformState(serviceUrl, validation.tfstate_token, validation.tfstate_key,
@@ -375,10 +393,15 @@ async function main() {
   }
   const commandEnvironment = { ...process.env };
   commandEnvironment.TFGIT_MODE = mode;
+  commandEnvironment.TFGIT_WORKING_DIRECTORY = relativeExecutionDirectory || '.';
   delete commandEnvironment.TFGIT_SECRET;
   delete commandEnvironment.INPUT_TFGIT_SECRET;
   delete commandEnvironment.GITHUB_TOKEN;
-  const steps = await runPlaybook(prePlaybook, mainPlaybook, postPlaybook, workspace,
+  if (!fs.existsSync(executionDirectory) || !fs.statSync(executionDirectory).isDirectory()) {
+    fail(`working_directory does not exist in the repository: ${workingDirectoryInput}`);
+  }
+  console.log(`[TFgit] Terraform commands will run from ${relativeExecutionDirectory || '.'}.`);
+  const steps = await runPlaybook(prePlaybook, mainPlaybook, postPlaybook, executionDirectory,
     expandedCommandArgs, commentCommandIndex, commandEnvironment, secret);
   console.log(`[TFgit] Playbook execution finished: ${steps.filter((step) => step.status === 'success').length}/${steps.length} command(s) succeeded.`);
   const playbookOutput = formatPlaybookOutput(steps).replaceAll(secret, '[REDACTED]');
