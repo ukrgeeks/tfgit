@@ -20,6 +20,7 @@ on:
         default: ""
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 jobs:
   terraform:
@@ -33,18 +34,10 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TFGIT_URL: https://tfgit.ukrgeeks.com
           TFGIT_SECRET: ${{ secrets.TFGIT_SECRET }}
-          # Optional: set one of these to pin the CLI version selected in TFgit Home.
-          # TERRAFORM_VERSION: "1.10.5"
-          # TOFU_VERSION: "1.10.0"
           # AWS credentials (uncomment and add these secrets to the repository):
           # AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           # AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           # AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
-          # Azure service principal credentials (uncomment and add these secrets):
-          # ARM_CLIENT_ID: ${{ secrets.ARM_CLIENT_ID }}
-          # ARM_CLIENT_SECRET: ${{ secrets.ARM_CLIENT_SECRET }}
-          # ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-          # ARM_TENANT_ID: ${{ secrets.ARM_TENANT_ID }}
 ```
 
 Set the default engine on **Playbooks → Default** and optionally override it on any repository playbook. Repository playbooks inherit the Default engine unless explicitly set. Available modes are Terraform, OpenTofu, and Custom. Terraform and OpenTofu modes install the latest CLI release by default and verify its SHA-256 checksum; pin a version with `TERRAFORM_VERSION` or `TOFU_VERSION`. Custom mode skips CLI installation and starts with empty pre-, main, and post-playbook commands so you can configure your own tools and commands. In OpenTofu mode, TFgit provides both `tofu` and `terraform` executable names, so existing playbook commands such as `terraform plan` continue to run using OpenTofu. Set `TFGIT_SECRET` from the repository Actions secret and `TFGIT_URL` to your TFgit service URL in the step environment. These can also be provided as action inputs (`tfgit_secret` and `service_url`) for compatibility. TFgit supplies the playbook and PR number. Before running commands, the action reads the PR through GitHub’s API and exports `GITHUB_PR_NUMBER`, `GITHUB_PR_BASE_BRANCH`, `GITHUB_PR_HEAD_BRANCH`, `GITHUB_PR_TITLE`, `GITHUB_PR_URL`, `GITHUB_PR_STATE`, `GITHUB_PR_AUTHOR`, `GITHUB_PR_BASE_REPOSITORY`, `GITHUB_PR_HEAD_REPOSITORY`, `GITHUB_PR_BASE_SHA`, `GITHUB_PR_HEAD_SHA`, and `GITHUB_PR_IS_DRAFT` to each playbook command. Use them like shell environment variables, for example `echo "$GITHUB_PR_BASE_BRANCH"`. The `GITHUB_TOKEN` environment variable is used internally for GitHub API calls; it is not a `github_token` action input.
