@@ -372,8 +372,10 @@ async function main() {
     if (validation.tfstate_key !== expectedStateKey) {
       fail('TFgit returned a state key that does not match this PR repository and base branch.');
     }
-    const stateFileName = String(validation.tfstate_path || '${GITHUB_PR_BASE_REPOSITORY}-${TFGIT_STATE_BRANCH}.tfstate')
+    const stateFileName = String(validation.tfstate_path || '${GITHUB_REPO_NAME}-${GITHUB_PR_BASE_BRANCH}.tfstate')
+      .replaceAll('${GITHUB_REPO_NAME}', pullRequestEnvironment.GITHUB_REPO_NAME)
       .replaceAll('${GITHUB_PR_BASE_REPOSITORY}', pullRequestEnvironment.GITHUB_PR_BASE_REPOSITORY)
+      .replaceAll('${GITHUB_PR_BASE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH)
       .replaceAll('${TFGIT_STATE_BRANCH}', pullRequestEnvironment.GITHUB_PR_BASE_BRANCH);
     terraformStateFile = safeWorkspaceFile(executionDirectory, stateFileName);
     if (stateRestoreThisRun) {
