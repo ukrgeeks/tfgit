@@ -34,7 +34,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           TFGIT_URL: https://tfgit.ukrgeeks.com
           TFGIT_SECRET: ${{ secrets.TFGIT_SECRET }}
-          # AWS credentials (uncomment and add these secrets to the repository):
+          # AWS credentials example
           # AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           # AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           # AWS_DEFAULT_REGION: ${{ vars.AWS_DEFAULT_REGION }}
