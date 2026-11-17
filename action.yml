@@ -20,3 +20,5 @@ inputs:
 runs:
   using: node20
   main: src/main.js
+  post: src/post.js
+  post-if: always()

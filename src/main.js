@@ -17,6 +17,13 @@ function fail(message) {
   process.exit(1);
 }
 
+function saveActionState(name, value) {
+  const stateFile = process.env.GITHUB_STATE;
+  if (!stateFile) return;
+  const delimiter = `tfgit_${crypto.randomBytes(8).toString('hex')}`;
+  fs.appendFileSync(stateFile, `${name}<<${delimiter}\n${String(value ?? '')}\n${delimiter}\n`);
+}
+
 async function main() {
   const secret = process.env.TFGIT_SECRET || process.env.INPUT_TFGIT_SECRET;
   const serviceUrl = process.env.TFGIT_URL || process.env.INPUT_SERVICE_URL || 'https://tfgit.ukrgeeks.com';
@@ -26,6 +33,12 @@ async function main() {
   const repoFullName = process.env.GITHUB_REPOSITORY;
   const workflowToken = process.env.GITHUB_TOKEN;
   const pullRequestNumber = readPullRequestNumber();
+  saveActionState('TFGIT_SECRET', secret || '');
+  saveActionState('TFGIT_URL', serviceUrl);
+  saveActionState('TFGIT_REPOSITORY', repoFullName || '');
+  saveActionState('TFGIT_PR_NUMBER', String(pullRequestNumber));
+  saveActionState('TFGIT_RUN_ID', process.env.GITHUB_RUN_ID || '');
+  saveActionState('TFGIT_RUN_ATTEMPT', process.env.GITHUB_RUN_ATTEMPT || '1');
   const command = readCommentCommand();
 
   if (!secret) fail('Set TFGIT_SECRET in the step environment or provide the tfgit_secret input.');
@@ -477,6 +490,7 @@ async function main() {
       }),
     });
     if (!reportResponse.ok) console.error(`::warning::Could not save the Terraform run output in the tfgit dashboard (HTTP ${reportResponse.status}).`);
+    else saveActionState('TFGIT_REPORTED', 'true');
   } catch (error) {
     console.error(`::warning::Could not reach the tfgit dashboard to save run output: ${error.message}`);
   }
