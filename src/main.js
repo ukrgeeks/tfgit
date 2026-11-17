@@ -576,7 +576,16 @@ async function restoreTerraformState(serviceUrl, stateToken, stateKey, stateFile
       console.log(`[TFgit] No saved state file exists for ${stateKey}; Terraform will initialize state in the runner.`);
       return { missing: true };
     }
-    if (result.status !== 0 || status !== 200) return { error: `storage returned HTTP ${status || result.status}` };
+    if (result.status !== 0 || status !== 200) {
+      let detail = '';
+      try {
+        if (fs.statSync(downloadedState).size <= 8192) {
+          const body = JSON.parse(fs.readFileSync(downloadedState, 'utf8'));
+          detail = typeof body.detail === 'string' ? body.detail : '';
+        }
+      } catch {}
+      return { error: `storage returned HTTP ${status || result.status}${detail ? `: ${detail}` : ''}` };
+    }
     const size = fs.statSync(downloadedState).size;
     if (size > MAX_TERRAFORM_STATE_BYTES) return { error: 'state file exceeds the 100 MiB limit' };
     console.log(`[TFgit] Found the saved state file (${formatBytes(size)}). Restoring it to the runner workspace.`);
