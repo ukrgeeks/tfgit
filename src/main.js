@@ -265,6 +265,28 @@ async function main() {
     .some((item) => /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(item));
   const applyIsRequested = [...prePlaybook, ...mainPlaybook, ...postPlaybook]
     .some((item) => /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(item));
+  if (applyIsRequested) {
+    const branchFreshness = await checkPullRequestBranchFreshness(owner, repo, pullRequest, apiHeaders);
+    if (!branchFreshness.current) {
+      const applyCommand = mode === 'tofu' ? 'tofu apply' : 'terraform apply';
+      const message = `Feature branch is outdated. Please merge the latest \`${pullRequest.base.ref}\` branch into the feature branch and try \`${applyCommand}\` again.`;
+      await postPullRequestComment(owner, repo, prNumber, apiHeaders, message);
+      fail(message);
+    }
+    if (validation.terraform_apply_requires_approval === true) {
+      const readiness = await checkPullRequestApprovalAndMergeability(owner, repo, prNumber, pullRequest, apiHeaders);
+      if (!readiness.approved) {
+        const message = 'This pull request is not approved yet. Get the required approval before running Terraform/OpenTofu apply.';
+        await postPullRequestComment(owner, repo, prNumber, apiHeaders, message);
+        fail(message);
+      }
+      if (!readiness.mergeable) {
+        const message = 'This pull request cannot be merged yet. Resolve any conflicts and satisfy required checks before running Terraform/OpenTofu apply.';
+        await postPullRequestComment(owner, repo, prNumber, apiHeaders, message);
+        fail(message);
+      }
+    }
+  }
   const workspaceRestoreCommands = [...prePlaybook, ...mainPlaybook, ...postPlaybook, ...expandedExecutionCommands];
   const restoreWorkspaceThisRun = workspaceStorageEnabled && (
     !workspaceRestoreComment || workspaceRestoreCommands.some((command) => commandMatchesStorageTrigger(command, workspaceRestoreComment))
@@ -974,6 +996,56 @@ async function getPullRequestDetails(owner, repo, prNumber, headers) {
     fail('GitHub did not return the pull request source branch.');
   }
   return pullRequest;
+}
+
+async function checkPullRequestBranchFreshness(owner, repo, pullRequest, headers) {
+  const headRepository = pullRequest.head?.repo?.full_name || `${owner}/${repo}`;
+  const headOwner = headRepository.split('/')[0];
+  const headBranch = pullRequest.head?.ref;
+  const baseBranch = pullRequest.base?.ref;
+  if (!headOwner || !headBranch || !baseBranch) fail('GitHub did not return the pull request source and target branches needed to check branch freshness.');
+  const headRef = `${encodeURIComponent(headOwner)}:${encodeURIComponent(headBranch)}`;
+  const response = await fetch(
+    `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${headRef}...${encodeURIComponent(baseBranch)}`,
+    { headers },
+  );
+  if (!response.ok) fail(`Could not check whether the feature branch is up to date (HTTP ${response.status}). Check contents: read permission.`);
+  const comparison = await response.json();
+  if (!Number.isInteger(comparison.ahead_by)) fail('GitHub did not return a valid pull request branch comparison.');
+  return { current: comparison.ahead_by === 0 };
+}
+
+async function checkPullRequestApprovalAndMergeability(owner, repo, prNumber, pullRequest, headers) {
+  const reviewStates = new Map();
+  for (let page = 1; ; page += 1) {
+    const response = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(prNumber)}/reviews?per_page=100&page=${page}`,
+      { headers },
+    );
+    if (!response.ok) fail(`Could not check pull request approvals (HTTP ${response.status}). Check pull-requests: read permission.`);
+    const reviews = await response.json();
+    if (!Array.isArray(reviews)) fail('GitHub returned an invalid pull request review list.');
+    for (const review of reviews) {
+      if (!review.user?.login || !review.submitted_at) continue;
+      const previous = reviewStates.get(review.user.login);
+      if (!previous || new Date(review.submitted_at) >= new Date(previous.submitted_at)) reviewStates.set(review.user.login, review);
+    }
+    if (reviews.length < 100) break;
+  }
+  let currentPullRequest = pullRequest;
+  for (let attempt = 0; attempt < 4 && currentPullRequest.mergeable === null; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    currentPullRequest = await getPullRequestDetails(owner, repo, prNumber, headers);
+  }
+  const author = currentPullRequest.user?.login?.toLowerCase();
+  const approved = [...reviewStates.values()].some((review) =>
+    review.user.login.toLowerCase() !== author
+    && review.state === 'APPROVED'
+    && review.commit_id === currentPullRequest.head?.sha);
+  const mergeable = currentPullRequest.draft !== true
+    && currentPullRequest.mergeable === true
+    && !['blocked', 'behind', 'dirty', 'draft', 'unknown'].includes(String(currentPullRequest.mergeable_state || '').toLowerCase());
+  return { approved, mergeable };
 }
 
 function readCommentCommand() {
