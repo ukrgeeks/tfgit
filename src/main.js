@@ -495,7 +495,14 @@ async function main() {
     console.error(`::warning::Could not reach the tfgit dashboard to save run output: ${error.message}`);
   }
   const commentSummaries = summarizeTerraformResults(steps, planSummaryEnabled);
-  const commentBodies = buildOutputComments(playbookOutput, runUrl, expandedCommentCommand || requestedCommand,
+  const terraformCommandStep = commentSummaries.errorLabel
+    ? steps.find((step) => step.status !== 'success' && /^\s*(?:terraform|tofu)\s+(?:plan|apply)(?:\s|$)/i.test(step.command))
+    : steps.find((step) => /^\s*(?:terraform|tofu)\s+(?:plan|apply)(?:\s|$)/i.test(step.command));
+  const displayedCommand = expandedCommentCommand || requestedCommand || terraformCommandStep?.command
+    .replace(/\s+-input=false\b/g, '')
+    .replace(/\s+-auto-approve\b/g, '')
+    .trim() || '';
+  const commentBodies = buildOutputComments(playbookOutput, runUrl, displayedCommand,
     commentSummaries.lines, commentSummaries.errorLabel);
   console.log(`[TFgit] Posting ${commentBodies.length} output comment(s) to PR #${prNumber}.`);
   for (const [index, body] of commentBodies.entries()) {
@@ -1269,7 +1276,11 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
   // Keep substantial headroom below GitHub's per-comment body limit for Markdown wrappers.
   const resourceSummary = summaries.find((summary) => summary.startsWith('SUMMARY\n'));
   const visibleSummaries = summaries.filter((summary) => summary !== resourceSummary);
-  if (resourceSummary) output = insertPlanSummary(output, resourceSummary);
+  if (resourceSummary) {
+    const formattedResourceSummary = `\`\`\`\n${resourceSummary}\n\`\`\``;
+    const planSummaryIndex = visibleSummaries.findIndex((summary) => /^Plan:/m.test(summary));
+    visibleSummaries.splice(planSummaryIndex < 0 ? visibleSummaries.length : planSummaryIndex + 1, 0, formattedResourceSummary);
+  }
   const chunkSize = 48000;
   const chunks = [];
   for (let offset = 0; offset < output.length;) {
@@ -1281,38 +1292,19 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
   }
   if (chunks.length === 0) chunks.push('(no output)');
   return chunks.map((chunk, index) => [
-    ...(errorLabel ? [`**${errorLabel}**`, ''] : []),
+    ...(index === 0 && command ? [`Command: \`${command}\``, ''] : []),
+    ...(index === 0 ? [`Run: [${runUrl}](${runUrl})`, ''] : []),
+    ...(index === 0 && errorLabel ? [`**${errorLabel}**`, ''] : []),
+    ...(index === 0 && visibleSummaries.length ? [visibleSummaries.join('\n\n'), ''] : []),
     '<details>',
-    `<summary>Show Output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
-    '',
-    ...(command ? [`Command: \`${command}\``, ''] : []),
-    `Run: ${runUrl}`,
+    `<summary>Show output${chunks.length > 1 ? ` (part ${index + 1} of ${chunks.length})` : ''}</summary>`,
     '',
     '````text',
     chunk,
     '````',
     '',
     '</details>',
-    ...(index === chunks.length - 1 && visibleSummaries.length ? ['', visibleSummaries.join('\n\n')] : []),
   ].join('\n'));
-}
-
-function insertPlanSummary(output, summary) {
-  const lines = output.split('\n');
-  const outputHeader = lines.findIndex((line) => /^\s*Changes to Outputs:\s*$/.test(line));
-  if (outputHeader < 0) return `${output}\n\n${summary}`;
-
-  let insertAt = outputHeader + 1;
-  while (insertAt < lines.length) {
-    const line = lines[insertAt];
-    if (/^\s*[-_]{5,}\s*$/.test(line) || /^\s*Note:/.test(line)) break;
-    if (line.trim()) insertAt += 1;
-    else if (insertAt + 1 < lines.length && lines[insertAt + 1].trim()
-      && !/^\s*[-_]{5,}\s*$/.test(lines[insertAt + 1]) && !/^\s*Note:/.test(lines[insertAt + 1])) insertAt += 1;
-    else break;
-  }
-  lines.splice(insertAt, 0, '', summary);
-  return lines.join('\n');
 }
 
 function summarizeTerraformResults(steps, planSummaryEnabled = true) {
@@ -1324,15 +1316,14 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
   const successfulPlan = steps.find((step) => step.status === 'success'
     && /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
   if (successfulPlan && planSummaryEnabled) {
-    const resourcesByAction = { create: new Set(), delete: new Set(), update: new Set(), read: new Set() };
-    const actionLine = /^\s*#\s+(.+?)\s+(?:will be (created|updated in-place|destroyed|read during apply|replaced)|must be replaced|is tainted, so must be replaced)\s*$/gm;
+    const resourcesByAction = { create: new Set(), delete: new Set(), update: new Set() };
+    const actionLine = /^\s*#\s+(.+?)\s+(?:will be (created|updated in-place|destroyed|replaced)|must be replaced|is tainted, so must be replaced)\s*$/gm;
     for (const match of successfulPlan.output.matchAll(actionLine)) {
       const address = match[1].trim();
       const action = match[2];
       if (action === 'created') resourcesByAction.create.add(address);
       else if (action === 'destroyed') resourcesByAction.delete.add(address);
       else if (action === 'updated in-place') resourcesByAction.update.add(address);
-      else if (action === 'read during apply') resourcesByAction.read.add(address);
       else {
         resourcesByAction.delete.add(address);
         resourcesByAction.create.add(address);
@@ -1341,35 +1332,39 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
     const resourceSummary = [
       ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'],
     ].map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
-    summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
-
     const counts = successfulPlan.output.match(planSummaryPattern);
     const noChanges = /No changes\. Your infrastructure matches the configuration\./i.test(successfulPlan.output);
     const planLine = counts
       ? `Plan: ${counts[1]} to add, ${counts[2]} to change, ${counts[3]} to destroy.`
       : noChanges ? 'Plan: 0 to add, 0 to change, 0 to destroy.' : '';
-    if (planLine && (noChanges || (counts && counts.slice(1).every((count) => Number(count) === 0)))) {
-      summaries.push([
-        '```sql',
-        'No changes. Your infrastructure matches the configuration.',
-        '',
-        'Terraform has compared your real infrastructure against your configuration',
-        'and found no differences, so no changes are needed.',
-        '```',
-      ].join('\n'));
-      summaries.push(planLine);
-    } else if (planLine) {
-      summaries.push(planLine);
-      summaries.push('- ▶️ To apply this plan, comment:');
-      const cli = /^\s*(tofu)\s+plan(?:\s|$)/i.test(successfulPlan.command) ? 'tofu' : 'terraform';
-      summaries.push(`\`\`\`text\n${cli} apply\n\`\`\``);
+    const noResourceChanges = noChanges || (counts && counts.slice(1).every((count) => Number(count) === 0));
+    if (planLine) summaries.push(planLine);
+    if (noResourceChanges) {
+      const engineName = /^\s*tofu\s+/i.test(successfulPlan.command) ? 'OpenTofu' : 'Terraform';
+      summaries.push(`No changes. Your infrastructure matches the configuration. ${engineName} has compared your real infrastructure against your configuration and found no differences, so no changes are needed.`);
+    } else {
+      summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
     }
   }
 
   const successfulApply = steps.find((step) => step.status === 'success' && /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
-  if (successfulApply) {
+  if (successfulApply && planSummaryEnabled) {
     const applySummary = successfulApply.output.match(/^Apply complete! Resources:[^\r\n]*$/m)?.[0];
-    if (applySummary) summaries.push(applySummary);
+    if (applySummary) {
+      summaries.push(applySummary);
+      const resourcesByAction = {create: new Set(), delete: new Set(), update: new Set()};
+      const completionLine = /^\s*(.+?):\s+(Creation|Modifications|Destruction) complete after\b/gm;
+      for (const match of successfulApply.output.matchAll(completionLine)) {
+        const address = match[1].trim();
+        if (match[2] === 'Creation') resourcesByAction.create.add(address);
+        else if (match[2] === 'Destruction') resourcesByAction.delete.add(address);
+        else resourcesByAction.update.add(address);
+      }
+      const resourceSummary = [
+        ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'],
+      ].map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
+      summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
+    }
   }
   return { lines: summaries, errorLabel };
 }
