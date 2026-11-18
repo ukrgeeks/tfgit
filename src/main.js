@@ -1350,7 +1350,7 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
   const applyPlanHint = summaries.find((summary) => summary.startsWith('APPLY_PLAN_HINT\n'));
   const visibleSummaries = summaries.filter((summary) => summary !== resourceSummary && summary !== applyPlanHint);
   if (resourceSummary) {
-    const formattedResourceSummary = `**SUMMARY**\n\n\`\`\`\n${resourceSummary.slice('SUMMARY\n'.length)}\n\`\`\``;
+    const formattedResourceSummary = `\`\`\`\n${resourceSummary.slice('SUMMARY\n'.length)}\n\`\`\``;
     const planSummaryIndex = visibleSummaries.findIndex((summary) => /^Plan:/m.test(summary));
     visibleSummaries.splice(planSummaryIndex < 0 ? visibleSummaries.length : planSummaryIndex + 1, 0, formattedResourceSummary);
   }
