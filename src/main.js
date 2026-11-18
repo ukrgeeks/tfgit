@@ -1275,7 +1275,8 @@ function stripTerminalSequences(value) {
 function buildOutputComments(output, runUrl, command = '', summaries = [], errorLabel = '') {
   // Keep substantial headroom below GitHub's per-comment body limit for Markdown wrappers.
   const resourceSummary = summaries.find((summary) => summary.startsWith('SUMMARY\n'));
-  const visibleSummaries = summaries.filter((summary) => summary !== resourceSummary);
+  const applyPlanHint = summaries.find((summary) => summary.startsWith('APPLY_PLAN_HINT\n'));
+  const visibleSummaries = summaries.filter((summary) => summary !== resourceSummary && summary !== applyPlanHint);
   if (resourceSummary) {
     const formattedResourceSummary = `\`\`\`\n${resourceSummary}\n\`\`\``;
     const planSummaryIndex = visibleSummaries.findIndex((summary) => /^Plan:/m.test(summary));
@@ -1304,6 +1305,7 @@ function buildOutputComments(output, runUrl, command = '', summaries = [], error
     '````',
     '',
     '</details>',
+    ...(index === chunks.length - 1 && applyPlanHint ? ['', applyPlanHint.slice('APPLY_PLAN_HINT\n'.length)] : []),
   ].join('\n'));
 }
 
@@ -1315,36 +1317,40 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
   const planSummaryPattern = /Plan:\s*(\d+)\s+to add,\s*(\d+)\s+to change,\s*(\d+)\s+to destroy\./i;
   const successfulPlan = steps.find((step) => step.status === 'success'
     && /^\s*(?:terraform|tofu)\s+plan(?:\s|$)/i.test(step.command));
-  if (successfulPlan && planSummaryEnabled) {
-    const resourcesByAction = { create: new Set(), delete: new Set(), update: new Set() };
-    const actionLine = /^\s*#\s+(.+?)\s+(?:will be (created|updated in-place|destroyed|replaced)|must be replaced|is tainted, so must be replaced)\s*$/gm;
-    for (const match of successfulPlan.output.matchAll(actionLine)) {
-      const address = match[1].trim();
-      const action = match[2];
-      if (action === 'created') resourcesByAction.create.add(address);
-      else if (action === 'destroyed') resourcesByAction.delete.add(address);
-      else if (action === 'updated in-place') resourcesByAction.update.add(address);
-      else {
-        resourcesByAction.delete.add(address);
-        resourcesByAction.create.add(address);
-      }
-    }
-    const resourceSummary = [
-      ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'],
-    ].map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
+  if (successfulPlan) {
     const counts = successfulPlan.output.match(planSummaryPattern);
     const noChanges = /No changes\. Your infrastructure matches the configuration\./i.test(successfulPlan.output);
     const planLine = counts
       ? `Plan: ${counts[1]} to add, ${counts[2]} to change, ${counts[3]} to destroy.`
       : noChanges ? 'Plan: 0 to add, 0 to change, 0 to destroy.' : '';
-    const noResourceChanges = noChanges || (counts && counts.slice(1).every((count) => Number(count) === 0));
-    if (planLine) summaries.push(planLine);
-    if (noResourceChanges) {
-      const engineName = /^\s*tofu\s+/i.test(successfulPlan.command) ? 'OpenTofu' : 'Terraform';
-      summaries.push(`No changes. Your infrastructure matches the configuration. ${engineName} has compared your real infrastructure against your configuration and found no differences, so no changes are needed.`);
-    } else {
-      summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
+    if (planSummaryEnabled) {
+      const resourcesByAction = { create: new Set(), delete: new Set(), update: new Set() };
+      const actionLine = /^\s*#\s+(.+?)\s+(?:will be (created|updated in-place|destroyed|replaced)|must be replaced|is tainted, so must be replaced)\s*$/gm;
+      for (const match of successfulPlan.output.matchAll(actionLine)) {
+        const address = match[1].trim();
+        const action = match[2];
+        if (action === 'created') resourcesByAction.create.add(address);
+        else if (action === 'destroyed') resourcesByAction.delete.add(address);
+        else if (action === 'updated in-place') resourcesByAction.update.add(address);
+        else {
+          resourcesByAction.delete.add(address);
+          resourcesByAction.create.add(address);
+        }
+      }
+      const resourceSummary = [
+        ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'],
+      ].map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
+      const noResourceChanges = noChanges || (counts && counts.slice(1).every((count) => Number(count) === 0));
+      if (planLine) summaries.push(planLine);
+      if (noResourceChanges) {
+        const engineName = /^\s*tofu\s+/i.test(successfulPlan.command) ? 'OpenTofu' : 'Terraform';
+        summaries.push(`No changes. Your infrastructure matches the configuration. ${engineName} has compared your real infrastructure against your configuration and found no differences, so no changes are needed.`);
+      } else {
+        summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
+      }
     }
+    const cli = /^\s*tofu\s+plan(?:\s|$)/i.test(successfulPlan.command) ? 'tofu' : 'terraform';
+    summaries.push(`APPLY_PLAN_HINT\n- ▶️ To apply this plan, comment:\n\`\`\`\n${cli} apply\n\`\`\``);
   }
 
   const successfulApply = steps.find((step) => step.status === 'success' && /^\s*(?:terraform|tofu)\s+apply(?:\s|$)/i.test(step.command));
