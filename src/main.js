@@ -1339,13 +1339,14 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
       }
       const resourceSummary = [
         ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'],
-      ].map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
+      ].filter(([action]) => resourcesByAction[action].size > 0)
+        .map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
       const noResourceChanges = noChanges || (counts && counts.slice(1).every((count) => Number(count) === 0));
       if (planLine) summaries.push(planLine);
       if (noResourceChanges) {
         const engineName = /^\s*tofu\s+/i.test(successfulPlan.command) ? 'OpenTofu' : 'Terraform';
         summaries.push(`No changes. Your infrastructure matches the configuration. ${engineName} has compared your real infrastructure against your configuration and found no differences, so no changes are needed.`);
-      } else {
+      } else if (resourceSummary.length) {
         summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
       }
     }
@@ -1368,8 +1369,9 @@ function summarizeTerraformResults(steps, planSummaryEnabled = true) {
       }
       const resourceSummary = [
         ['delete', 'deleted'], ['create', 'created'], ['update', 'updated'],
-      ].map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
-      summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
+      ].filter(([action]) => resourcesByAction[action].size > 0)
+        .map(([action, label]) => [label, ...([...resourcesByAction[action]].sort().map((address) => `  - ${address}`))].join('\n'));
+      if (resourceSummary.length) summaries.push(`SUMMARY\n${resourceSummary.join('\n')}`);
     }
   }
   return { lines: summaries, errorLabel };
